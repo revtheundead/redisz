@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn handleClient(io: Io, connection: Io.net.Server.Connection) Io.Cancelable!void {
+fn handleClient(io: Io, connection: Io.net.Stream) Io.Cancelable!void {
     defer connection.close(io);
 
     var connection_writer = connection.writer(io, &.{});
