@@ -30,18 +30,19 @@ pub fn parseValue(r: *Io.Reader, arena: std.mem.Allocator) ParseError!Value {
     };
 }
 
+fn takeCrlfLine(r: *Io.Reader) Io.Reader.DelimiterError![]const u8 {
+    const line = try r.takeDelimiterInclusive('\n');
+    return std.mem.trimEnd(u8, line, "\r\n");
+}
+
 // Takes copies of strings after trimming "\r\n"
 fn takeLineCopy(r: *Io.Reader, arena: std.mem.Allocator) ParseError![]const u8 {
-    const line = try r.takeDelimiterExclusive('\n');
-    const trimmed = std.mem.trimEnd(u8, line, "\r");
-    return arena.dupe(u8, trimmed);
+    return arena.dupe(u8, try takeCrlfLine(r));
 }
 
 // Parses an integer line
 fn parseIntegerLine(r: *Io.Reader) ParseError!i64 {
-    const line = try r.takeDelimiterExclusive('\n');
-    const trimmed = std.mem.trimEnd(u8, line, "\r");
-    return std.fmt.parseInt(i64, trimmed, 10);
+    return std.fmt.parseInt(i64, try takeCrlfLine(r), 10);
 }
 
 // Parses bulk strings

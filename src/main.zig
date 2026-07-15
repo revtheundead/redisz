@@ -38,7 +38,14 @@ fn handleClient(io: Io, stream: Io.net.Stream) Io.Cancelable!void {
     while (true) {
         _ = arena_state.reset(.retain_capacity);
 
-        const value = resp.parseValue(&stream_reader.interface, arena) catch break;
+        const value = resp.parseValue(&stream_reader.interface, arena) catch |err| switch (err) {
+            error.ReadFailed => {
+                const e = stream_reader.err orelse break;
+                if (e == error.Canceled) return error.Canceled;
+                break;
+            },
+            else => break,
+        };
 
         dispatch(&stream_writer.interface, value) catch break;
     }
