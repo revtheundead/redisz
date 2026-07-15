@@ -1,4 +1,5 @@
 const std = @import("std");
+const resp = @import("resp.zig");
 const Io = std.Io;
 
 pub fn main(init: std.process.Init) !void {
@@ -23,15 +24,51 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn handleClient(io: Io, connection: Io.net.Stream) Io.Cancelable!void {
-    defer connection.close(io);
+fn handleClient(io: Io, stream: Io.net.Stream) Io.Cancelable!void {
+    defer stream.close(io);
 
-    var connection_writer = connection.writer(io, &.{});
-    var buf: [1024]u8 = undefined;
-    var data = [_][]u8{&buf};
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var read_buf: [4096]u8 = undefined;
+    var stream_reader = stream.reader(io, &read_buf);
+    var stream_writer = stream.writer(io, &.{});
+
     while (true) {
-        const bytes_read = io.vtable.netRead(io.userdata, connection.socket.handle, &data) catch break;
-        if (bytes_read == 0) break;
-        connection_writer.interface.writeAll("+PONG\r\n") catch break;
+        _ = arena_state.reset(.retain_capacity);
+
+        const value = resp.parseValue(&stream_reader.interface, arena) catch break;
+
+        dispatch(&stream_writer.interface, value) catch break;
+    }
+}
+
+fn dispatch(w: *Io.Writer, value: resp.Value) !void {
+    const args = switch (value) {
+        .array => |maybe| maybe orelse return,
+        else => return,
+    };
+    if (args.len == 0) return;
+
+    const cmd = switch (args[0]) {
+        .bulk_string => |maybe| maybe orelse return,
+        else => return,
+    };
+
+    if (std.ascii.eqlIgnoreCase(cmd, "PING")) {
+        try w.writeAll("+PONG\r\n");
+    } else if (std.ascii.eqlIgnoreCase(cmd, "ECHO")) {
+        if (args.len < 2) {
+            try w.writeAll("-ERR wrong number of arguments for 'echo'\r\n");
+            return;
+        }
+        const arg = switch (args[1]) {
+            .bulk_string => |maybe| maybe orelse "",
+            else => return,
+        };
+        try resp.writeBulkString(w, arg);
+    } else {
+        try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
 }
