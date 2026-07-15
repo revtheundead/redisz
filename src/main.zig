@@ -3,6 +3,10 @@ const resp = @import("resp.zig");
 const Store = @import("store.zig").Store;
 const Io = std.Io;
 
+fn nowMs(io: Io) i64 {
+    return Io.Clock.awake.now(io).toMilliseconds();
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -90,7 +94,33 @@ fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, valu
             .bulk_string => |m| m orelse return,
             else => return,
         };
-        try store.set(io, key, val);
+
+        var expires_at_ms: ?i64 = null;
+        var i: usize = 3;
+        while (i < args.len) : (i += 1) {
+            const opt = switch (args[i]) {
+                .bulk_string => |m| m orelse return,
+                else => return,
+            };
+
+            if (std.ascii.eqlIgnoreCase(opt, "PX") or std.ascii.eqlIgnoreCase(opt, "EX")) {
+                i += 1;
+                if (i >= args.len) return try w.writeAll("-ERR syntax error\r\n");
+                const ttl_str = switch (args[i]) {
+                    .bulk_string => |m| m orelse return,
+                    else => return,
+                };
+                const ttl = std.fmt.parseInt(i64, ttl_str, 10) catch {
+                    return try w.writeAll("-ERR value is not an integer or out of range\r\n");
+                };
+                const ttl_ms = if (std.ascii.eqlIgnoreCase(opt, "PX")) ttl else ttl * 1000;
+                expires_at_ms = nowMs(io) + ttl_ms;
+            } else {
+                return try w.writeAll("-ERR syntax error\r\n");
+            }
+        }
+
+        try store.set(io, key, val, expires_at_ms);
         try w.writeAll("+OK\r\n");
     } else if (std.ascii.eqlIgnoreCase(cmd, "GET")) {
         if (args.len < 2) return try w.writeAll("-ERR wrong number of arguments for 'get'\r\n");
@@ -98,7 +128,7 @@ fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, valu
             .bulk_string => |m| m orelse return,
             else => return,
         };
-        if (try store.get(io, arena, key)) |val| {
+        if (try store.get(io, arena, key, nowMs(io))) |val| {
             try resp.writeBulkString(w, val);
         } else {
             try w.writeAll("$-1\r\n");
