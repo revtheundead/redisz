@@ -16,5 +16,11 @@ pub fn main(init: std.process.Init) !void {
     defer connection.close(io);
 
     var connection_writer = connection.writer(io, &.{});
-    try connection_writer.interface.writeAll("+PONG\r\n");
+    var buf: [1024]u8 = undefined;
+    var data = [_][]u8{&buf};
+    while (true) {
+        const bytes_read = io.vtable.netRead(io.userdata, connection.socket.handle, &data);
+        if (bytes_read == 0) break;
+        try connection_writer.interface.writeAll("+PONG\r\n");
+    }
 }
