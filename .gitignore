@@ -3,6 +3,9 @@ main
 zig-cache/
 .zig-cache/
 zig-out/
+.claude/
+CONTEXT.md
+docs/
 
 # Compiled binary output
 bin/
