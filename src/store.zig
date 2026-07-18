@@ -114,37 +114,33 @@ pub const Store = struct {
     // Append one value to the tail of the list at `key`. Creates an empty list
     // if the key is absent/expired. WrongType if the key holds a non-list value.
     // Returns the new list length.
-    pub fn listPushTail(self: *Store, io: Io, key: []const u8, value: []const u8, now_ms: i64) GetError!usize {
-        const value_copy = try self.gpa.dupe(u8, value);
-        errdefer self.gpa.free(value_copy);
-
+    pub fn listPushTail(self: *Store, io: Io, key: []const u8, values: []const []const u8, now_ms: i64) GetError!usize {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
 
+        var list_ptr: *List = undefined;
         if (self.getLiveEntry(key, now_ms)) |entry_ptr| {
             switch (entry_ptr.value) {
-                .list => |*list| {
-                    try list.append(self.gpa, value_copy);
-                    self.notifyListPush(key);
-                    return list.items.len;
-                },
+                .list => |*l| list_ptr = l,
                 else => return error.WrongType,
             }
+        } else {
+            const key_copy = try self.gpa.dupe(u8, key);
+            errdefer self.gpa.free(key_copy);
+
+            const gop = try self.map.getOrPut(self.gpa, key_copy);
+            gop.value_ptr.* = .{ .value = .{ .list = .empty }, .expires_at_ms = null };
+            list_ptr = &gop.value_ptr.value.list;
         }
 
-        // New-key path, allocate key, build a one-element list, hand both to the map.
-        const key_copy = try self.gpa.dupe(u8, key);
-        errdefer self.gpa.free(key_copy);
-
-        var list: List = .empty;
-        errdefer list.deinit(self.gpa);
-        try list.append(self.gpa, value_copy);
-
-        const gop = try self.map.getOrPut(self.gpa, key_copy);
-        gop.value_ptr.* = .{ .value = .{ .list = list }, .expires_at_ms = null };
+        // Reserve capacity in one call so no append reallocates mid-loop.
+        try list_ptr.ensureUnusedCapacity(self.gpa, values.len);
+        for (values) |v| {
+            list_ptr.appendAssumeCapacity(try self.gpa.dupe(u8, v));
+        }
 
         self.notifyListPush(key);
-        return 1;
+        return list_ptr.items.len;
     }
 
     // Wake seam for blocked clients on this key (BLPOP/BRPOP).

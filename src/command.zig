@@ -31,7 +31,7 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
     } else if (std.ascii.eqlIgnoreCase(cmd, "GET")) {
         try handleGet(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "RPUSH")) {
-        try handleRpush(io, w, store, args);
+        try handleRpush(io, arena, w, store, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -107,18 +107,25 @@ fn handleGet(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, arg
     }
 }
 
-fn handleRpush(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+fn handleRpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
     if (args.len < 3) return try resp.writeError(w, "ERR wrong number of arguments for 'rpush'");
     const key = switch (args[1]) {
         .bulk_string => |m| m orelse return,
         else => return,
     };
-    const value = switch (args[2]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
 
-    const new_len = store.listPushTail(io, key, value, nowMs(io)) catch |err| switch (err) {
+    // Unpack the values from args[2..] into a plain slice. Arena-allocated,
+    // the store dupes each value with gpa, so nothing here needs to outlive
+    // dispatch.
+    const values = try arena.alloc([]const u8, args.len - 2);
+    for (args[2..], values) |arg, *slot| {
+        slot.* = switch (arg) {
+            .bulk_string => |m| m orelse return,
+            else => return,
+        };
+    }
+
+    const new_len = store.listPushTail(io, key, values, nowMs(io)) catch |err| switch (err) {
         error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
         else => |e| return e,
     };
