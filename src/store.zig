@@ -20,6 +20,8 @@ pub const Store = struct {
     map: std.StringArrayHashMapUnmanaged(Entry),
     mutex: Io.Mutex,
 
+    pub const Side = enum { head, tail };
+
     const Entry = struct {
         value: StoredValue,
         expires_at_ms: ?i64,
@@ -111,10 +113,10 @@ pub const Store = struct {
         return @tagName(entry.value);
     }
 
-    // Append one value to the tail of the list at `key`. Creates an empty list
-    // if the key is absent/expired. WrongType if the key holds a non-list value.
+    // Push one or more values to `key` on `side`. Creates an empty list if
+    // the key is absent/expired. WrongType if the key holds a non-list value.
     // Returns the new list length.
-    pub fn listPushTail(self: *Store, io: Io, key: []const u8, values: []const []const u8, now_ms: i64) GetError!usize {
+    pub fn listPush(self: *Store, io: Io, key: []const u8, values: []const []const u8, side: Side, now_ms: i64) GetError!usize {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
 
@@ -133,10 +135,26 @@ pub const Store = struct {
             list_ptr = &gop.value_ptr.value.list;
         }
 
-        // Reserve capacity in one call so no append reallocates mid-loop.
-        try list_ptr.ensureUnusedCapacity(self.gpa, values.len);
-        for (values) |v| {
-            list_ptr.appendAssumeCapacity(try self.gpa.dupe(u8, v));
+        switch (side) {
+            .tail => {
+                // Reserve capacity in one call so no append reallocates mid-loop.
+                try list_ptr.ensureUnusedCapacity(self.gpa, values.len);
+                for (values) |v| {
+                    list_ptr.appendAssumeCapacity(try self.gpa.dupe(u8, v));
+                }
+            },
+            .head => {
+                // Redis LPUSH prepends each value one at a time, so input
+                // [a, b, c] ends up as [c, b, a] at the head. Insert-at-0
+                // per iteration makes that ordering visible. It's O(len)
+                // per insert on ArrayList; a doubly-linked backing would be
+                // O(1). See the List type-alias note at the top of the file.
+                for (values) |v| {
+                    const dup = try self.gpa.dupe(u8, v);
+                    errdefer self.gpa.free(dup);
+                    try list_ptr.insert(self.gpa, 0, dup);
+                }
+            },
         }
 
         self.notifyListPush(key);

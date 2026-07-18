@@ -32,6 +32,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleGet(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "RPUSH")) {
         try handleRpush(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "LPUSH")) {
+        try handleLpush(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "LRANGE")) {
         try handleLrange(io, arena, w, store, args);
     } else {
@@ -127,7 +129,33 @@ fn handleRpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
         };
     }
 
-    const new_len = store.listPushTail(io, key, values, nowMs(io)) catch |err| switch (err) {
+    const new_len = store.listPush(io, key, values, .tail, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    try resp.writeInteger(w, @intCast(new_len));
+}
+
+fn handleLpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    if (args.len < 3) return try resp.writeError(w, "ERR wrong number of arguments for 'rpush'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    // Unpack the values from args[2..] into a plain slice. Arena-allocated,
+    // the store dupes each value with gpa, so nothing here needs to outlive
+    // dispatch.
+    const values = try arena.alloc([]const u8, args.len - 2);
+    for (args[2..], values) |arg, *slot| {
+        slot.* = switch (arg) {
+            .bulk_string => |m| m orelse return,
+            else => return,
+        };
+    }
+
+    const new_len = store.listPush(io, key, values, .head, nowMs(io)) catch |err| switch (err) {
         error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
         else => |e| return e,
     };
