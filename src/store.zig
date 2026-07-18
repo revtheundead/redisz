@@ -154,7 +154,7 @@ pub const Store = struct {
 
     pub fn listRange(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, start: i64, stop: i64, now_ms: i64) GetError![]const []const u8 {
         try self.mutex.lock(io);
-        errdefer self.mutex.unlock(io);
+        defer self.mutex.unlock(io);
 
         const entry = self.getLiveEntry(key, now_ms) orelse return &.{};
         const list = switch (entry.value) {
