@@ -202,4 +202,17 @@ pub const Store = struct {
 
         return out;
     }
+
+    pub fn listLength(self: *Store, io: Io, key: []const u8, now_ms: i64) GetError!usize {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+
+        const entry = self.getLiveEntry(key, now_ms) orelse return 0;
+        const list = switch (entry.value) {
+            .list => |l| l,
+            else => return error.WrongType,
+        };
+
+        return list.items.len;
+    }
 };
