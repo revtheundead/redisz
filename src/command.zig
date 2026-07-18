@@ -132,7 +132,7 @@ fn handleRpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
     }
 
     const new_len = store.listPush(io, key, values, .tail, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
         else => |e| return e,
     };
 
@@ -158,7 +158,7 @@ fn handleLpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
     }
 
     const new_len = store.listPush(io, key, values, .head, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
         else => |e| return e,
     };
 
@@ -188,7 +188,7 @@ fn handleLrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, 
     };
 
     const items = store.listRange(io, arena, key, start, stop, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
         else => |e| return e,
     };
 
@@ -197,14 +197,14 @@ fn handleLrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, 
 }
 
 fn handleLlen(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'rpush'");
+    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'llen'");
     const key = switch (args[1]) {
         .bulk_string => |m| m orelse return,
         else => return,
     };
 
     const len = store.listLength(io, key, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
         else => |e| return e,
     };
 
