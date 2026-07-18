@@ -30,6 +30,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleSet(io, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "GET")) {
         try handleGet(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "RPUSH")) {
+        try handleRpush(io, w, store, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -103,4 +105,23 @@ fn handleGet(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, arg
     } else {
         try resp.writeNullBulk(w);
     }
+}
+
+fn handleRpush(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    if (args.len < 3) return try resp.writeError(w, "ERR wrong number of arguments for 'rpush'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+    const value = switch (args[2]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const new_len = store.listPushTail(io, key, value, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    try resp.writeInteger(w, @intCast(new_len));
 }

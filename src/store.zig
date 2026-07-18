@@ -1,10 +1,16 @@
 const std = @import("std");
 const Io = std.Io;
 
+// Redis list backing. ArrayList gives O(1) tail-push and O(1) LINDEX, at the cost
+// of O(n) head-push. Real Redis uses a quicklist (linked list of listpacks);
+// swappable behind this alias when it matters.
+pub const List = std.ArrayListUnmanaged([]const u8);
+
 // Discriminated payload for a key. String is the only variant today; list, stream,
 // hash and zset will land as their Codecrafters sections start.
 pub const StoredValue = union(enum) {
     string: []const u8,
+    list: List,
 };
 
 pub const GetError = error{WrongType} || std.mem.Allocator.Error || Io.Cancelable;
@@ -39,6 +45,11 @@ pub const Store = struct {
     fn freeValue(gpa: std.mem.Allocator, v: StoredValue) void {
         switch (v) {
             .string => |s| gpa.free(s),
+            .list => |list| {
+                for (list.items) |elem| gpa.free(elem);
+                var mut = list;
+                mut.deinit(gpa);
+            },
         }
     }
 
@@ -86,6 +97,7 @@ pub const Store = struct {
 
         return switch (entry.value) {
             .string => |s| try out_arena.dupe(u8, s),
+            else => error.WrongType,
         };
     }
 
@@ -97,5 +109,50 @@ pub const Store = struct {
 
         const entry = self.getLiveEntry(key, now_ms) orelse return null;
         return @tagName(entry.value);
+    }
+
+    // Append one value to the tail of the list at `key`. Creates an empty list
+    // if the key is absent/expired. WrongType if the key holds a non-list value.
+    // Returns the new list length.
+    pub fn listPushTail(self: *Store, io: Io, key: []const u8, value: []const u8, now_ms: i64) GetError!usize {
+        const value_copy = try self.gpa.dupe(u8, value);
+        errdefer self.gpa.free(value_copy);
+
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+
+        if (self.getLiveEntry(key, now_ms)) |entry_ptr| {
+            switch (entry_ptr.value) {
+                .list => |*list| {
+                    try list.append(self.gpa, value_copy);
+                    self.notifyListPush(key);
+                    return list.items.len;
+                },
+                else => return error.WrongType,
+            }
+        }
+
+        // New-key path, allocate key, build a one-element list, hand both to the map.
+        const key_copy = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(key_copy);
+
+        var list: List = .empty;
+        errdefer list.deinit(self.gpa);
+        try list.append(self.gpa, value_copy);
+
+        const gop = try self.map.getOrPut(self.gpa, key_copy);
+        gop.value_ptr.* = .{ .value = .{ .list = list }, .expires_at_ms = null };
+
+        self.notifyListPush(key);
+        return 1;
+    }
+
+    // Wake seam for blocked clients on this key (BLPOP/BRPOP).
+    // No subscribers today; called after every list mutation so the wire is in
+    // place. When BLPOP lands, this grows into a wait-queue lookup — call sites
+    // don't change.
+    fn notifyListPush(self: *Store, key: []const u8) void {
+        _ = self;
+        _ = key;
     }
 };
