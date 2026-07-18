@@ -162,12 +162,18 @@ pub const Store = struct {
             else => return error.WrongType,
         };
 
-        // Positive-index clamping, translate negatives
+        // Translate negative indices ("−k" = "len − k"). Redis clamps a start
+        // that's still below zero after translation to 0, and leaves a still-
+        // negative stop alone — the `s > e` guard below turns that into an
+        // empty reply.
         const len_i: i64 = @intCast(list.items.len);
-        if (start < 0 or start >= len_i or start > stop) return &.{};
-        const end_incl = @min(stop, len_i - 1);
+        const s: i64 = if (start < 0) @max(start + len_i, 0) else start;
+        const e: i64 = if (stop < 0) stop + len_i else stop;
 
-        const begin: usize = @intCast(start);
+        if (s >= len_i or s > e) return &.{};
+        const end_incl = @min(e, len_i - 1);
+
+        const begin: usize = @intCast(s);
         const end: usize = @intCast(end_incl + 1);
         const slice = list.items[begin..end];
 
