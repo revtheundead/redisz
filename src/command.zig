@@ -32,6 +32,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleGet(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "RPUSH")) {
         try handleRpush(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "LRANGE")) {
+        try handleLrange(io, arena, w, store, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -131,4 +133,35 @@ fn handleRpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
     };
 
     try resp.writeInteger(w, @intCast(new_len));
+}
+
+fn handleLrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    if (args.len < 4) return try resp.writeError(w, "ERR wrong number of arguments for 'lrange'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+    const start_str = switch (args[2]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+    const stop_str = switch (args[3]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const start = std.fmt.parseInt(i64, start_str, 10) catch {
+        return try resp.writeError(w, "ERR value is not an integer or out of range");
+    };
+    const stop = std.fmt.parseInt(i64, stop_str, 10) catch {
+        return try resp.writeError(w, "ERR value is not an integer or out of range");
+    };
+
+    const items = store.listRange(io, arena, key, start, stop, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    try resp.writeArrayHeader(w, items.len);
+    for (items) |item| try resp.writeBulkString(w, item);
 }

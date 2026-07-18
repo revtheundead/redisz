@@ -151,4 +151,31 @@ pub const Store = struct {
         _ = self;
         _ = key;
     }
+
+    pub fn listRange(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, start: i64, stop: i64, now_ms: i64) GetError![]const []const u8 {
+        try self.mutex.lock(io);
+        errdefer self.mutex.unlock(io);
+
+        const entry = self.getLiveEntry(key, now_ms) orelse return &.{};
+        const list = switch (entry.value) {
+            .list => |l| l,
+            else => return error.WrongType,
+        };
+
+        // Positive-index clamping, translate negatives
+        const len_i: i64 = @intCast(list.items.len);
+        if (start < 0 or start >= len_i or start > stop) return &.{};
+        const end_incl = @min(stop, len_i - 1);
+
+        const begin: usize = @intCast(start);
+        const end: usize = @intCast(end_incl + 1);
+        const slice = list.items[begin..end];
+
+        const out = try out_arena.alloc([]const u8, slice.len);
+        for (slice, out) |elem, *slot| {
+            slot.* = try out_arena.dupe(u8, elem);
+        }
+
+        return out;
+    }
 };
