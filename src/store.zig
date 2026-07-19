@@ -170,9 +170,13 @@ pub const Store = struct {
         _ = key;
     }
 
-    // Remove and return the head element of the list at `key`. Arena-owned copy.
-    //   null       → key absent, expired, or list is empty
-    //   WrongType  → key holds a non-list value
+    // Pop up to `count` elements from the head or tail of the list at `key`.
+    // Returns null when the key is absent/expired, the caller distinguishes
+    // "no key" from "popped zero elements from an existing key" (the latter
+    // is an empty slice, not null). WrongType when the key holds a non-list.
+    // Popped elements are arena-owned; the store's copies are freed. When
+    // the pop empties the list, the key is deleted (Redis's "no empty
+    // collections" invariant).
     pub fn listPop(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, count: usize, side: Side, now_ms: i64) GetError!?[]const []const u8 {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
