@@ -19,6 +19,9 @@ pub const Store = struct {
     gpa: std.mem.Allocator,
     map: std.StringArrayHashMapUnmanaged(Entry),
     mutex: Io.Mutex,
+    // Per-key FIFO of blocked clients. Empty entries are removed when the last
+    // waiter for a key is dequeued (see dequeueWaiter).
+    waiters: std.StringHashMapUnmanaged(std.DoublyLinkedList),
 
     pub const Side = enum { head, tail };
 
@@ -27,12 +30,20 @@ pub const Store = struct {
         expires_at_ms: ?i64,
     };
 
+    // A parked BLPOP client. Lives on the caller's stack, the handler task
+    // stays inside listPopBlocking until wake/timeout/cancel, so the frame
+    // remains valid the whole time the waiter is queued.
+    const Waiter = struct {
+        // Element handed over by the signaler; gpa-owned. Null while queued.
+        // Set (with mutex held) before signal() so the wake sees it.
+        delivered: ?[]const u8 = null,
+        // Per-waiter condvar. signal() wakes exactly this waiter, not a random one.
+        condition: Io.Condition = .init,
+        node: std.DoublyLinkedList.Node = .{},
+    };
+
     pub fn init(gpa: std.mem.Allocator) Store {
-        return .{
-            .gpa = gpa,
-            .map = .empty,
-            .mutex = .init,
-        };
+        return .{ .gpa = gpa, .map = .empty, .mutex = .init, .waiters = .empty };
     }
 
     pub fn deinit(self: *Store) void {
@@ -42,6 +53,14 @@ pub const Store = struct {
             freeValue(self.gpa, entry.value_ptr.value);
         }
         self.map.deinit(self.gpa);
+
+        // Waiters map: free duped keys. The DoublyLinkedList entries are
+        // Waiter nodes owned by their respective task stacks, no cleanup
+        // owed here. In practice this map should be empty at shutdown since
+        // all client tasks were awaited.
+        var wait_it = self.waiters.iterator();
+        while (wait_it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        self.waiters.deinit(self.gpa);
     }
 
     fn freeValue(gpa: std.mem.Allocator, v: StoredValue) void {
@@ -157,17 +176,32 @@ pub const Store = struct {
             },
         }
 
-        self.notifyListPush(key);
-        return list_ptr.items.len;
-    }
+        // Hand off elements to BLPOP waiters, FIFO. Each waiter takes one element
+        // from the head. Loop stop when we run out of either waiters or elements.
+        if (self.waiters.getPtr(key)) |waiters_list| {
+            while (waiters_list.first) |first_node| {
+                if (list_ptr.items.len == 0) break;
+                const waiter: *Waiter = @fieldParentPtr("node", first_node);
+                waiters_list.remove(first_node);
+                const elem = list_ptr.orderedRemove(0);
+                waiter.delivered = elem; // ownership transfers to the waiter
+                waiter.condition.signal(io); // wake exactly that one waiter
+            }
+            if (waiters_list.first == null) {
+                if (self.waiters.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+            }
+        }
 
-    // Wake seam for blocked clients on this key (BLPOP/BRPOP).
-    // No subscribers today; called after every list mutation so the wire is in
-    // place. When BLPOP lands, this grows into a wait-queue lookup — call sites
-    // don't change.
-    fn notifyListPush(self: *Store, key: []const u8) void {
-        _ = self;
-        _ = key;
+        // Delete-on-empty (Redis's "no empty collections" invariant): if
+        // waiters drained the whole list, delete the key.
+        const final_len = list_ptr.items.len;
+        if (final_len == 0) {
+            const kv = self.map.fetchSwapRemove(key).?;
+            self.gpa.free(kv.key);
+            freeValue(self.gpa, kv.value.value);
+        }
+
+        return final_len;
     }
 
     // Pop up to `count` elements from the head or tail of the list at `key`.
@@ -276,5 +310,114 @@ pub const Store = struct {
         };
 
         return list.items.len;
+    }
+
+    // Caller must hold self.mutex
+    fn enqueueWaiter(self: *Store, key: []const u8, waiter: *Waiter) !void {
+        const key_copy = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(key_copy);
+
+        const gop = try self.waiters.getOrPut(self.gpa, key_copy);
+        if (gop.found_existing) {
+            self.gpa.free(key_copy);
+        } else {
+            gop.value_ptr.* = .{};
+        }
+
+        gop.value_ptr.append(&waiter.node);
+    }
+
+    // Caller must hold self.mutex. Idempotent: no-op if waiter isn't queued.
+    fn dequeueWaiter(self: *Store, key: []const u8, waiter: *Waiter) void {
+        const list_ptr = self.waiters.getPtr(key) orelse return;
+        list_ptr.remove(&waiter.node);
+        if (list_ptr.first == null) {
+            if (self.waiters.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+        }
+    }
+
+    pub const BlockedPop = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    fn blpopTimeoutSignaler(io: Io, duration_ms: u64, mutex: *Io.Mutex, cond: *Io.Condition) void {
+        // Sleep may return error.Canceled — bail out silently in that case,
+        // it means the waiter got its element and cancelled us.
+        Io.Clock.awake.sleep(io, .fromMilliseconds(duration_ms)) catch return;
+        // Signal under the mutex so the write is synchronized with the waiter's read.
+        mutex.lock(io) catch return;
+        defer mutex.unlock(io);
+        cond.signal(io);
+    }
+
+    // Pop the head of `key`'s list. If the list is non-empty, act like a
+    // non-blocking single-element listPop. If empty or absent, park as a
+    // waiter and wait for either a push or the timeout. `timeout_ms == null`
+    // means block indefinitely. Returns null on timeout.
+    pub fn listPopBlocking(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, timeout_ms: ?u64, now_ms: i64) GetError!?BlockedPop {
+        try self.mutex.lock(io);
+        var mutex_held = true;
+        defer if (mutex_held) self.mutex.unlock(io);
+
+        // Fast path, element is already available.
+        if (self.getLiveEntry(key, now_ms)) |entry_ptr| {
+            switch (entry_ptr.value) {
+                .list => |*list| {
+                    if (list.items.len > 0) {
+                        const out_key = try out_arena.dupe(u8, key);
+                        const out_value = try out_arena.dupe(u8, list.items[0]);
+                        const removed = list.orderedRemove(0);
+                        self.gpa.free(removed);
+                        if (list.items.len == 0) {
+                            const kv = self.map.fetchSwapRemove(key).?;
+                            self.gpa.free(kv.key);
+                            freeValue(self.gpa, kv.value.value);
+                        }
+                        return .{ .key = out_key, .value = out_value };
+                    }
+                },
+                else => return error.WrongType,
+            }
+        }
+
+        // Slow path, park and wait.
+        var waiter: Waiter = .{};
+        try self.enqueueWaiter(key, &waiter);
+
+        // Wait for delivery. Infinite → condvar. Bounded → poll: release mutex,
+        // sleep briefly, reacquire, check `delivered`. The mutex-held flag guards
+        // the outer defer against errors from sleep or lock (which can only occur
+        // on task cancellation, at which point the outer teardown is unwinding).
+        if (timeout_ms) |ms| {
+            const deadline_ms = now_ms + @as(i64, @intCast(ms));
+            while (waiter.delivered == null) {
+                const cur = Io.Clock.awake.now(io).toMilliseconds();
+                if (cur >= deadline_ms) break;
+
+                self.mutex.unlock(io);
+                mutex_held = false;
+                try io.sleep(.fromMilliseconds(50), .awake);
+                try self.mutex.lock(io);
+                mutex_held = true;
+            }
+        } else {
+            waiter.condition.wait(io, &self.mutex) catch |err| {
+                self.dequeueWaiter(key, &waiter);
+                return err;
+            };
+        }
+
+        // Post-wait: signaler sets delivered before signaling / before we notice
+        // on our next poll. If it's set, take the element; else we timed out.
+        if (waiter.delivered) |delivered| {
+            defer self.gpa.free(delivered);
+            const out_key = try out_arena.dupe(u8, key);
+            const out_value = try out_arena.dupe(u8, delivered);
+            return .{ .key = out_key, .value = out_value };
+        }
+
+        self.dequeueWaiter(key, &waiter);
+        return null;
     }
 };

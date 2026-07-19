@@ -36,6 +36,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleLpush(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "LPOP")) {
         try handleLpop(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "BLPOP")) {
+        try handleBlpop(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "LRANGE")) {
         try handleLrange(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "LLEN")) {
@@ -203,6 +205,39 @@ fn handleLpop(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, ar
         const items = maybe_items orelse return try resp.writeNullArray(w);
         try resp.writeArrayHeader(w, items.len);
         for (items) |item| try resp.writeBulkString(w, item);
+    }
+}
+
+fn handleBlpop(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    // Real BLPOP accepts multiple keys before the timeout: BLPOP k1 k2 ... timeout.
+    // Single-key only for now, implement multi-key later.
+    if (args.len != 3) return try resp.writeError(w, "ERR wrong number of arguments for 'blpop'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+    const timeout_str = switch (args[2]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const timeout_secs = std.fmt.parseInt(i64, timeout_str, 10) catch {
+        return try resp.writeError(w, "ERR timeout is not a valid float");
+    };
+    if (timeout_secs < 0) return try resp.writeError(w, "ERR timeout is negative");
+    const timeout_ms: ?u64 = if (timeout_secs == 0) null else @as(u64, @intCast(timeout_secs)) * 1000;
+
+    const maybe_result = store.listPopBlocking(io, arena, key, timeout_ms, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    if (maybe_result) |result| {
+        try resp.writeArrayHeader(w, 2);
+        try resp.writeBulkString(w, result.key);
+        try resp.writeBulkString(w, result.value);
+    } else {
+        try resp.writeNullArray(w);
     }
 }
 
