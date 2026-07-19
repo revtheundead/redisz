@@ -173,28 +173,55 @@ pub const Store = struct {
     // Remove and return the head element of the list at `key`. Arena-owned copy.
     //   null       → key absent, expired, or list is empty
     //   WrongType  → key holds a non-list value
-    pub fn listPopHead(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, now_ms: i64) GetError!?[]const u8 {
+    pub fn listPop(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, count: usize, side: Side, now_ms: i64) GetError!?[]const []const u8 {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
 
         const entry = self.getLiveEntry(key, now_ms) orelse return null;
         switch (entry.value) {
             .list => |*list| {
-                if (list.items.len == 0) return null;
+                const available = list.items.len;
+                const n = @min(count, available);
+                const out = try out_arena.alloc([]const u8, n);
 
-                // Take ownership of the head slot before removing it from the list.
-                // orderedRemove(0) shifts everything left by one, O(len). A DLL
-                // backing would be O(1). (Same tradeoff as LPUSH, see the List
-                // type-alias note.)
-                const head = list.items[0];
-                _ = list.orderedRemove(0);
+                // Phase 1: dupe all n elements into the arena. This is the only
+                // fallible work; if it errors partway, the store hasn't been
+                // touched yet, so the state stays consistent (partial arena
+                // allocs die on the next command's reset).
+                switch (side) {
+                    .head => {
+                        for (0..n) |i| out[i] = try out_arena.dupe(u8, list.items[i]);
+                    },
+                    .tail => {
+                        // Pop order is last-first: RPOP list 2 returns [last, second-last].
+                        for (0..n) |i| out[i] = try out_arena.dupe(u8, list.items[available - 1 - i]);
+                    },
+                }
 
-                // Copy to arena so we can free the gpa-owned original before unlock.
-                const out = try out_arena.dupe(u8, head);
-                self.gpa.free(head);
+                // Phase 2: mutate the store. Infallible — free gpa copies, then
+                // truncate. Only when Phase 1 fully succeeded do we get here.
+                switch (side) {
+                    .head => {
+                        for (list.items[0..n]) |elem| self.gpa.free(elem);
+                        // Shift remaining elements left by n. Forward iteration is
+                        // correct because destination [0..) is entirely before source
+                        // [n..) — every read happens before its slot is overwritten.
+                        for (0..available - n) |i| list.items[i] = list.items[i + n];
+                        list.items.len -= n;
+                    },
+                    .tail => {
+                        for (list.items[available - n ..]) |elem| self.gpa.free(elem);
+                        list.items.len -= n;
+                    },
+                }
 
-                // Real Redis deletes a key whose key becomes empty. Skipping that
-                // for now keeps the state model simple; add it later.
+                // Delete-on-empty. Same invariant as single-element listPop.
+                if (list.items.len == 0) {
+                    const kv = self.map.fetchSwapRemove(key).?;
+                    self.gpa.free(kv.key);
+                    freeValue(self.gpa, kv.value.value);
+                }
+
                 return out;
             },
             else => return error.WrongType,

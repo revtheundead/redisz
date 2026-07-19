@@ -168,21 +168,41 @@ fn handleLpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
 }
 
 fn handleLpop(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'lpop'");
+    if (args.len < 2 or args.len > 3) return try resp.writeError(w, "ERR wrong number of arguments for 'lpop'");
     const key = switch (args[1]) {
         .bulk_string => |m| m orelse return,
         else => return,
     };
 
-    const maybe_val = store.listPopHead(io, arena, key, nowMs(io)) catch |err| switch (err) {
+    // Count is optional. Its PRESENCE, not its value, decides the reply
+    // shape. LPOP key → bulk-or-null. LPOP key 0 → empty array, not null.
+    const count: ?usize = if (args.len == 3) blk: {
+        const count_str = switch (args[2]) {
+            .bulk_string => |m| m orelse return,
+            else => return,
+        };
+        const parsed = std.fmt.parseInt(i64, count_str, 10) catch {
+            return try resp.writeError(w, "ERR value is not an integer or out of range");
+        };
+        if (parsed < 0) return try resp.writeError(w, "ERR value is out of range, must be positive");
+        break :blk @intCast(parsed);
+    } else null;
+
+    const maybe_items = store.listPop(io, arena, key, count orelse 1, .head, nowMs(io)) catch |err| switch (err) {
         error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
         else => |e| return e,
     };
 
-    if (maybe_val) |val| {
-        try resp.writeBulkString(w, val);
+    if (count == null) {
+        // Single-element mode: bulk-or-null.
+        const items = maybe_items orelse return try resp.writeNullBulk(w);
+        if (items.len == 0) return try resp.writeNullBulk(w);
+        try resp.writeBulkString(w, items[0]);
     } else {
-        try resp.writeNullBulk(w);
+        // Count mode: null-array on absent key, else an array of items.
+        const items = maybe_items orelse return try resp.writeNullArray(w);
+        try resp.writeArrayHeader(w, items.len);
+        for (items) |item| try resp.writeBulkString(w, item);
     }
 }
 
