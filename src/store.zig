@@ -176,32 +176,33 @@ pub const Store = struct {
             },
         }
 
-        // Hand off elements to BLPOP waiters, FIFO. Each waiter takes one element
-        // from the head. Loop stop when we run out of either waiters or elements.
+        // RPUSH/LPUSH report the length after append. BLPOP handoff below is a
+        // separate event that doesn't refund the push count.
+        const push_length = list_ptr.items.len;
+
+        // Hand off elements to BLPOP waiters, FIFO.
         if (self.waiters.getPtr(key)) |waiters_list| {
             while (waiters_list.first) |first_node| {
                 if (list_ptr.items.len == 0) break;
                 const waiter: *Waiter = @fieldParentPtr("node", first_node);
                 waiters_list.remove(first_node);
                 const elem = list_ptr.orderedRemove(0);
-                waiter.delivered = elem; // ownership transfers to the waiter
-                waiter.condition.signal(io); // wake exactly that one waiter
+                waiter.delivered = elem;
+                waiter.condition.signal(io);
             }
             if (waiters_list.first == null) {
                 if (self.waiters.fetchRemove(key)) |kv| self.gpa.free(kv.key);
             }
         }
 
-        // Delete-on-empty (Redis's "no empty collections" invariant): if
-        // waiters drained the whole list, delete the key.
-        const final_len = list_ptr.items.len;
-        if (final_len == 0) {
+        // Delete-on-empty uses actual final length.
+        if (list_ptr.items.len == 0) {
             const kv = self.map.fetchSwapRemove(key).?;
             self.gpa.free(kv.key);
             freeValue(self.gpa, kv.value.value);
         }
 
-        return final_len;
+        return push_length;
     }
 
     // Pop up to `count` elements from the head or tail of the list at `key`.
