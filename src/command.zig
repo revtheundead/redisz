@@ -221,11 +221,16 @@ fn handleBlpop(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
         else => return,
     };
 
-    const timeout_secs = std.fmt.parseInt(i64, timeout_str, 10) catch {
+    const timeout_secs = std.fmt.parseFloat(f64, timeout_str) catch {
         return try resp.writeError(w, "ERR timeout is not a valid float");
     };
-    if (timeout_secs < 0) return try resp.writeError(w, "ERR timeout is negative");
-    const timeout_ms: ?u64 = if (timeout_secs == 0) null else @as(u64, @intCast(timeout_secs)) * 1000;
+    if (!std.math.isFinite(timeout_secs) or timeout_secs < 0) {
+        return try resp.writeError(w, "ERR timeout is negative");
+    }
+    const timeout_ms: ?u64 = if (timeout_secs == 0.0)
+        null
+    else
+        @intFromFloat(timeout_secs * 1000.0);
 
     const maybe_result = store.listPopBlocking(io, arena, key, timeout_ms, nowMs(io)) catch |err| switch (err) {
         error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
