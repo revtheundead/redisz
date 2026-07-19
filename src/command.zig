@@ -34,6 +34,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleRpush(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "LPUSH")) {
         try handleLpush(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "LPOP")) {
+        try handleLpop(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "LRANGE")) {
         try handleLrange(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "LLEN")) {
@@ -163,6 +165,25 @@ fn handleLpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
     };
 
     try resp.writeInteger(w, @intCast(new_len));
+}
+
+fn handleLpop(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'lpop'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const maybe_val = store.listPopHead(io, arena, key, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    if (maybe_val) |val| {
+        try resp.writeBulkString(w, val);
+    } else {
+        try resp.writeNullBulk(w);
+    }
 }
 
 fn handleLrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
