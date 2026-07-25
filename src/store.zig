@@ -6,11 +6,19 @@ const Io = std.Io;
 // swappable behind this alias when it matters.
 pub const List = std.ArrayListUnmanaged([]const u8);
 
+pub const StreamEntry = struct {
+    id: []const u8, // gpa owned
+    fields: [][]const u8, // flat [k0, v0, k1, v1, ...], each gpa owned
+};
+
+pub const Stream = std.ArrayListUnmanaged(StreamEntry);
+
 // Discriminated payload for a key. String is the only variant today; list, stream,
 // hash and zset will land as their Codecrafters sections start.
 pub const StoredValue = union(enum) {
     string: []const u8,
     list: List,
+    stream: Stream,
 };
 
 pub const GetError = error{WrongType} || std.mem.Allocator.Error || Io.Cancelable;
@@ -69,6 +77,15 @@ pub const Store = struct {
             .list => |list| {
                 for (list.items) |elem| gpa.free(elem);
                 var mut = list;
+                mut.deinit(gpa);
+            },
+            .stream => |stream| {
+                for (stream.items) |entry| {
+                    gpa.free(entry.id);
+                    for (entry.fields) |f| gpa.free(f);
+                    gpa.free(entry.fields);
+                }
+                var mut = stream;
                 mut.deinit(gpa);
             },
         }
@@ -420,5 +437,44 @@ pub const Store = struct {
 
         self.dequeueWaiter(key, &waiter);
         return null;
+    }
+
+    pub fn streamAdd(self: *Store, io: Io, key: []const u8, id: []const u8, fields: []const []const u8, now_ms: i64) GetError!void {
+        // Phase 1: dupe into gpa. All the fallible work sits above the lock so
+        // if it errors, no store state changed
+        const id_copy = try self.gpa.dupe(u8, id);
+        errdefer self.gpa.free(id_copy);
+
+        const fields_copy = try self.gpa.alloc([]const u8, fields.len);
+        errdefer self.gpa.free(fields_copy);
+
+        // ``duped` is re-read when the errdefer fires, so it always reflects the
+        // real count of live coies at unwind time.
+        var duped: usize = 0;
+        errdefer for (fields_copy[0..duped]) |f| self.gpa.free(f);
+        while (duped < fields.len) : (duped += 1) {
+            fields_copy[duped] = try self.gpa.dupe(u8, fields[duped]);
+        }
+
+        // Phase 2: mutate. The lock is only held for the map/stream ops.
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+
+        var stream_ptr: *Stream = undefined;
+        if (self.getLiveEntry(key, now_ms)) |entry_ptr| {
+            switch (entry_ptr.value) {
+                .stream => |*s| stream_ptr = s,
+                else => return error.WrongType,
+            }
+        } else {
+            const key_copy = try self.gpa.dupe(u8, key);
+            errdefer self.gpa.free(key_copy);
+
+            const gop = try self.map.getOrPut(self.gpa, key_copy);
+            gop.value_ptr.* = .{ .value = .{ .stream = .empty }, .expires_at_ms = null };
+            stream_ptr = &gop.value_ptr.value.stream;
+        }
+
+        try stream_ptr.append(self.gpa, .{ .id = id_copy, .fields = fields_copy });
     }
 };

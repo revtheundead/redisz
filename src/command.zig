@@ -44,6 +44,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleLlen(io, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "TYPE")) {
         try handleType(io, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "XADD")) {
+        try handleXadd(io, arena, w, store, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -304,4 +306,35 @@ fn handleType(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !v
     const maybe_tag = try store.getType(io, key, nowMs(io));
     const name = maybe_tag orelse "none";
     try resp.writeSimpleString(w, name);
+}
+
+fn handleXadd(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    // XADD key id field1 value1 [field2 value2 ...]
+    // Need key + id + at least one field/value pair, and pairs must be even.
+    if (args.len < 5 or (args.len - 3) % 2 != 0) {
+        return try resp.writeError(w, "ERR wrong number of arguments for 'xadd'");
+    }
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+    const id = switch (args[2]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const fields = try arena.alloc([]const u8, args.len - 3);
+    for (args[3..], fields) |arg, *slot| {
+        slot.* = switch (arg) {
+            .bulk_string => |m| m orelse return,
+            else => return,
+        };
+    }
+
+    store.streamAdd(io, key, id, fields, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    try resp.writeBulkString(w, id);
 }
