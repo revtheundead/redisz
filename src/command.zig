@@ -4,7 +4,7 @@ const Store = @import("store.zig").Store;
 const Io = std.Io;
 
 fn nowMs(io: Io) i64 {
-    return Io.Clock.awake.now(io).toMilliseconds();
+    return Io.Clock.real.now(io).toMilliseconds();
 }
 
 // Top-level command router. Reads args[0] and dispatches to a handler.

@@ -429,7 +429,7 @@ pub const Store = struct {
         // the outer defer against errors from sleep or lock (which can only occur
         // on task cancellation, at which point the outer teardown is unwinding).
         if (timeout_ms) |ms| {
-            const deadline_ms = now_ms + @as(i64, @intCast(ms));
+            const deadline_ms = Io.Clock.awake.now(io).toMilliseconds() + @as(i64, @intCast(ms));
             while (waiter.delivered == null) {
                 const cur = Io.Clock.awake.now(io).toMilliseconds();
                 if (cur >= deadline_ms) break;
