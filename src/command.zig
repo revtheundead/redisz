@@ -42,6 +42,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleLrange(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "LLEN")) {
         try handleLlen(io, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "TYPE")) {
+        try handleType(io, w, store, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -290,4 +292,16 @@ fn handleLlen(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !v
     };
 
     try resp.writeInteger(w, @intCast(len));
+}
+
+fn handleType(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    if (args.len != 2) return try resp.writeError(w, "ERR wrong number of arguments for 'type'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const maybe_tag = try store.getType(io, key, nowMs(io));
+    const name = maybe_tag orelse "none";
+    try resp.writeSimpleString(w, name);
 }
