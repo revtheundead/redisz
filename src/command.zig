@@ -318,9 +318,13 @@ fn handleXadd(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, ar
         .bulk_string => |m| m orelse return,
         else => return,
     };
-    const id = switch (args[2]) {
+    const id_str = switch (args[2]) {
         .bulk_string => |m| m orelse return,
         else => return,
+    };
+
+    const id_spec = parseStreamIdSpec(id_str) catch {
+        return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
     };
 
     const fields = try arena.alloc([]const u8, args.len - 3);
@@ -331,10 +335,25 @@ fn handleXadd(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, ar
         };
     }
 
-    store.streamAdd(io, key, id, fields, nowMs(io)) catch |err| switch (err) {
+    const assigned = store.streamAdd(io, key, id_spec, fields, nowMs(io)) catch |err| switch (err) {
         error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+        error.IdZero => return try resp.writeError(w, "ERR The ID specified in XADD must be greater than 0-0"),
+        error.IdEqualOrSmaller => return try resp.writeError(w, "ERR The ID specified in XADD is equal or smaller than the target stream top item"),
         else => |e| return e,
     };
 
-    try resp.writeBulkString(w, id);
+    // u64-u64: max 20 + 1 + 20 = 41 bytes
+    var buf: [48]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}-{d}", .{ assigned.ms, assigned.seq }) catch unreachable;
+    try resp.writeBulkString(w, s);
+}
+
+fn parseStreamIdSpec(s: []const u8) !@import("store.zig").StreamIdSpec {
+    if (std.mem.eql(u8, s, "*")) return .fully_auto;
+    const dash = std.mem.indexOfScalar(u8, s, '-') orelse return error.InvalidId;
+    const ms = std.fmt.parseInt(u64, s[0..dash], 10) catch return error.InvalidId;
+    const rest = s[dash + 1 ..];
+    if (std.mem.eql(u8, rest, "*")) return .{ .ms_auto_seq = ms };
+    const seq = std.fmt.parseInt(u64, rest, 10) catch return error.InvalidId;
+    return .{ .explicit = .{ .ms = ms, .seq = seq } };
 }

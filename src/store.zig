@@ -1,13 +1,37 @@
 const std = @import("std");
 const Io = std.Io;
 
+pub const GetError = error{WrongType} || std.mem.Allocator.Error || Io.Cancelable;
+
 // Redis list backing. ArrayList gives O(1) tail-push and O(1) LINDEX, at the cost
 // of O(n) head-push. Real Redis uses a quicklist (linked list of listpacks);
 // swappable behind this alias when it matters.
 pub const List = std.ArrayListUnmanaged([]const u8);
 
+pub const StreamEntryId = struct {
+    ms: u64,
+    seq: u64,
+
+    pub fn order(a: StreamEntryId, b: StreamEntryId) std.math.Order {
+        return switch (std.math.order(a.ms, b.ms)) {
+            .eq => std.math.order(a.seq, b.seq),
+            else => |o| o,
+        };
+    }
+};
+
+// What the caller *asked for*. The store resolves this into a concrete
+// StreamEntryId, filling in whichever parts were auto (`*`).
+pub const StreamIdSpec = union(enum) {
+    explicit: StreamEntryId, // "ms-seq"
+    ms_auto_seq: u64, // "ms-*"
+    fully_auto, // "*"
+};
+
+pub const StreamAddError = error{ IdEqualOrSmaller, IdZero } || GetError;
+
 pub const StreamEntry = struct {
-    id: []const u8, // gpa owned
+    id: StreamEntryId, // gpa owned
     fields: [][]const u8, // flat [k0, v0, k1, v1, ...], each gpa owned
 };
 
@@ -20,8 +44,6 @@ pub const StoredValue = union(enum) {
     list: List,
     stream: Stream,
 };
-
-pub const GetError = error{WrongType} || std.mem.Allocator.Error || Io.Cancelable;
 
 pub const Store = struct {
     gpa: std.mem.Allocator,
@@ -81,7 +103,6 @@ pub const Store = struct {
             },
             .stream => |stream| {
                 for (stream.items) |entry| {
-                    gpa.free(entry.id);
                     for (entry.fields) |f| gpa.free(f);
                     gpa.free(entry.fields);
                 }
@@ -439,12 +460,7 @@ pub const Store = struct {
         return null;
     }
 
-    pub fn streamAdd(self: *Store, io: Io, key: []const u8, id: []const u8, fields: []const []const u8, now_ms: i64) GetError!void {
-        // Phase 1: dupe into gpa. All the fallible work sits above the lock so
-        // if it errors, no store state changed
-        const id_copy = try self.gpa.dupe(u8, id);
-        errdefer self.gpa.free(id_copy);
-
+    pub fn streamAdd(self: *Store, io: Io, key: []const u8, id_spec: StreamIdSpec, fields: []const []const u8, now_ms: i64) StreamAddError!StreamEntryId {
         const fields_copy = try self.gpa.alloc([]const u8, fields.len);
         errdefer self.gpa.free(fields_copy);
 
@@ -475,6 +491,46 @@ pub const Store = struct {
             stream_ptr = &gop.value_ptr.value.stream;
         }
 
-        try stream_ptr.append(self.gpa, .{ .id = id_copy, .fields = fields_copy });
+        // Resolve the id spec against the last entry (if any) and validate.
+        // Errors here return without touching the stream, the errordefers up top
+        // free the field copies. The empty stream we amy have just created stays
+        // in the map; matches the same wart listPush has.
+        const last: ?StreamEntryId = if (stream_ptr.items.len == 0)
+            null
+        else
+            stream_ptr.items[stream_ptr.items.len - 1].id;
+        const id = try resolveStreamId(id_spec, last, now_ms);
+
+        try stream_ptr.append(self.gpa, .{ .id = id, .fields = fields_copy });
+        return id;
+    }
+
+    fn resolveStreamId(spec: StreamIdSpec, last: ?StreamEntryId, now_ms: i64) StreamAddError!StreamEntryId {
+        const id: StreamEntryId = switch (spec) {
+            .explicit => |e| e,
+            .ms_auto_seq => |ms| .{ .ms = ms, .seq = nextSeqFor(ms, last) },
+            .fully_auto => blk: {
+                const now: u64 = if (now_ms < 0) 0 else @intCast(now_ms);
+                // If the wall clock went backwards vs. the last entry, don't
+                // regress, clamp ms up so we stay strictly monotonic.
+                const ms = if (last) |l| @max(l.ms, now) else now;
+                break :blk .{ .ms = ms, .seq = nextSeqFor(ms, last) };
+            },
+        };
+
+        if (id.ms == 0 and id.seq == 0) return error.IdZero;
+        if (last) |l| switch (id.order(l)) {
+            .gt => {},
+            else => return error.IdEqualOrSmaller,
+        };
+
+        return id;
+    }
+
+    // Next sequence number for a given ms bucket. On an empty bucket the seq
+    // starts at 0, except for ms==0 where the 0-0 taboo forces it to 1.
+    fn nextSeqFor(ms: u64, last: ?StreamEntryId) u64 {
+        if (last) |l| if (l.ms == ms) return l.seq + 1;
+        return if (ms == 0) 1 else 0;
     }
 };
