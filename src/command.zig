@@ -49,6 +49,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleXadd(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "XRANGE")) {
         try handleXrange(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "XREAD")) {
+        try handleXread(io, arena, w, store, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -410,13 +412,13 @@ fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
         else => return,
     };
 
-    const start = parseXreadStart(start_str);
+    const start = parseXreadStart(start_str) catch return;
 
     const start_next = nextStreamId(start) orelse {
         try resp.writeArrayHeader(w, 0);
         return;
     };
-    const max_id = .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
+    const max_id: StreamEntryId = .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
 
     const entries = store.streamRange(io, arena, key, start_next, max_id, nowMs(io)) catch |err| switch (err) {
         error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -463,9 +465,9 @@ fn parseXreadStart(s: []const u8) !StreamEntryId {
     if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
         const ms = try std.fmt.parseInt(u64, s[0..dash], 10);
         const seq = try std.fmt.parseInt(u64, s[dash + 1 ..], 10);
-        return .{ .id = .{ .ms = ms, .seq = seq } };
+        return .{ .ms = ms, .seq = seq };
     }
     // Redis accepts bare "ms" and treats seq as 0.
     const ms = try std.fmt.parseInt(u64, s, 10);
-    return .{ .id = .{ .ms = ms, .seq = 0 } };
+    return .{ .ms = ms, .seq = 0 };
 }
