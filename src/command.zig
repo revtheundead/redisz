@@ -402,7 +402,7 @@ fn handleXrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, 
 }
 
 fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len != 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xrange'");
+    if (args.len != 3) return try resp.writeError(w, "ERR wrong number of arguments for 'xread'");
     const key = switch (args[1]) {
         .bulk_string => |m| m orelse return,
         else => return,
