@@ -37,6 +37,11 @@ pub const StreamEntry = struct {
 
 pub const Stream = std.ArrayListUnmanaged(StreamEntry);
 
+pub const StreamRangeEntry = struct {
+    id: StreamEntryId,
+    fields: []const []const u8,
+};
+
 // Discriminated payload for a key. String is the only variant today; list, stream,
 // hash and zset will land as their Codecrafters sections start.
 pub const StoredValue = union(enum) {
@@ -532,5 +537,41 @@ pub const Store = struct {
     fn nextSeqFor(ms: u64, last: ?StreamEntryId) u64 {
         if (last) |l| if (l.ms == ms) return l.seq + 1;
         return if (ms == 0) 1 else 0;
+    }
+
+    // Inclusive [start, end] scan. Copies matched entries' fields into out_arena
+    // so the caller can walk them after releasing the store mutex.
+    pub fn streamRange(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, start: StreamEntryId, end: StreamEntryId, now_ms: i64) GetError![]const StreamRangeEntry {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+
+        const entry_ptr = self.getLiveEntry(key, now_ms) orelse return &.{};
+        const stream = switch (entry_ptr.value) {
+            .stream => |s| s,
+            else => return error.WrongType,
+        };
+
+        // Two-pass: count matches first so we can alloc the outer slice exactly
+        // then dupe. Entries are sorted by construction, so we `break` past `end`
+        // instead of scanning the whole stream
+        var count: usize = 0;
+        for (stream.items) |e| {
+            if (e.id.order(start) == .lt) continue;
+            if (e.id.order(end) == .gt) break;
+            count += 1;
+        }
+
+        const out = try out_arena.alloc(StreamRangeEntry, count);
+        var i: usize = 0;
+        for (stream.items) |e| {
+            if (e.id.order(start) == .lt) continue;
+            if (e.id.order(end) == .gt) break;
+            const fields = try out_arena.alloc([]const u8, e.fields.len);
+            for (e.fields, fields) |src, *slot| slot.* = try out_arena.dupe(u8, src);
+            out[i] = .{ .id = e.id, .fields = fields };
+            i += 1;
+        }
+
+        return out;
     }
 };

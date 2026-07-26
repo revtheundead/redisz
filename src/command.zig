@@ -46,6 +46,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleType(io, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "XADD")) {
         try handleXadd(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "XRANGE")) {
+        try handleXrange(io, arena, w, store, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -356,4 +358,58 @@ fn parseStreamIdSpec(s: []const u8) !@import("store.zig").StreamIdSpec {
     if (std.mem.eql(u8, rest, "*")) return .{ .ms_auto_seq = ms };
     const seq = std.fmt.parseInt(u64, rest, 10) catch return error.InvalidId;
     return .{ .explicit = .{ .ms = ms, .seq = seq } };
+}
+
+fn parseStreamRangeBounds(s: []const u8, default_seq: u64) !@import("store.zig").StreamEntryId {
+    if (default_seq == 0 and std.mem.eql(u8, s, "-")) {
+        return .{ .ms = 0, .seq = 0 };
+    }
+    if (default_seq != 0 and std.mem.eql(u8, s, "+")) {
+        return .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
+    }
+    if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
+        const ms = try std.fmt.parseInt(u64, s[0..dash], 10);
+        const seq = try std.fmt.parseInt(u64, s[dash + 1 ..], 10);
+        return .{ .ms = ms, .seq = seq };
+    }
+    const ms = try std.fmt.parseInt(u64, s, 10);
+    return .{ .ms = ms, .seq = default_seq };
+}
+
+fn handleXrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    if (args.len != 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xrange'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+    const start_str = switch (args[2]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+    const end_str = switch (args[3]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const start = parseStreamRangeBounds(start_str, 0) catch {
+        return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
+    };
+    const end = parseStreamRangeBounds(end_str, std.math.maxInt(u64)) catch {
+        return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
+    };
+
+    const entries = store.streamRange(io, arena, key, start, end, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    try resp.writeArrayHeader(w, entries.len);
+    var buf: [48]u8 = undefined;
+    for (entries) |entry| {
+        try resp.writeArrayHeader(w, 2);
+        const id_str = std.fmt.bufPrint(&buf, "{d}-{d}", .{ entry.id.ms, entry.id.seq }) catch unreachable;
+        try resp.writeBulkString(w, id_str);
+        try resp.writeArrayHeader(w, entry.fields.len);
+        for (entry.fields) |f| try resp.writeBulkString(w, f);
+    }
 }
