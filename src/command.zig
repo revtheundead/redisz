@@ -425,6 +425,9 @@ fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
         else => |e| return e,
     };
 
+    try resp.writeArrayHeader(w, 1); // 1 for now
+    try resp.writeArrayHeader(w, 2);
+    try resp.writeBulkString(w, key);
     try resp.writeArrayHeader(w, entries.len);
     var buf: [48]u8 = undefined;
     for (entries) |entry| {
