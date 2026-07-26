@@ -1,6 +1,7 @@
 const std = @import("std");
 const resp = @import("resp.zig");
 const Store = @import("store.zig").Store;
+const StreamEntryId = @import("store.zig").StreamEntryId;
 const Io = std.Io;
 
 fn nowMs(io: Io) i64 {
@@ -360,22 +361,6 @@ fn parseStreamIdSpec(s: []const u8) !@import("store.zig").StreamIdSpec {
     return .{ .explicit = .{ .ms = ms, .seq = seq } };
 }
 
-fn parseStreamRangeBounds(s: []const u8, default_seq: u64) !@import("store.zig").StreamEntryId {
-    if (default_seq == 0 and std.mem.eql(u8, s, "-")) {
-        return .{ .ms = 0, .seq = 0 };
-    }
-    if (default_seq != 0 and std.mem.eql(u8, s, "+")) {
-        return .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
-    }
-    if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
-        const ms = try std.fmt.parseInt(u64, s[0..dash], 10);
-        const seq = try std.fmt.parseInt(u64, s[dash + 1 ..], 10);
-        return .{ .ms = ms, .seq = seq };
-    }
-    const ms = try std.fmt.parseInt(u64, s, 10);
-    return .{ .ms = ms, .seq = default_seq };
-}
-
 fn handleXrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
     if (args.len != 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xrange'");
     const key = switch (args[1]) {
@@ -412,4 +397,75 @@ fn handleXrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, 
         try resp.writeArrayHeader(w, entry.fields.len);
         for (entry.fields) |f| try resp.writeBulkString(w, f);
     }
+}
+
+fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    if (args.len != 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xrange'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+    const start_str = switch (args[2]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const start = parseXreadStart(start_str);
+
+    const start_next = nextStreamId(start) orelse {
+        try resp.writeArrayHeader(w, 0);
+        return;
+    };
+    const max_id = .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
+
+    const entries = store.streamRange(io, arena, key, start_next, max_id, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    try resp.writeArrayHeader(w, entries.len);
+    var buf: [48]u8 = undefined;
+    for (entries) |entry| {
+        try resp.writeArrayHeader(w, 2);
+        const id_str = std.fmt.bufPrint(&buf, "{d}-{d}", .{ entry.id.ms, entry.id.seq }) catch unreachable;
+        try resp.writeBulkString(w, id_str);
+        try resp.writeArrayHeader(w, entry.fields.len);
+        for (entry.fields) |f| try resp.writeBulkString(w, f);
+    }
+}
+
+fn parseStreamRangeBounds(s: []const u8, default_seq: u64) !StreamEntryId {
+    if (default_seq == 0 and std.mem.eql(u8, s, "-")) {
+        return .{ .ms = 0, .seq = 0 };
+    }
+    if (default_seq != 0 and std.mem.eql(u8, s, "+")) {
+        return .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
+    }
+    if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
+        const ms = try std.fmt.parseInt(u64, s[0..dash], 10);
+        const seq = try std.fmt.parseInt(u64, s[dash + 1 ..], 10);
+        return .{ .ms = ms, .seq = seq };
+    }
+    const ms = try std.fmt.parseInt(u64, s, 10);
+    return .{ .ms = ms, .seq = default_seq };
+}
+
+fn nextStreamId(id: StreamEntryId) ?StreamEntryId {
+    if (id.seq == std.math.maxInt(u64)) {
+        if (id.ms == std.math.maxInt(u64)) return null; // saturated
+        return .{ .ms = id.ms + 1, .seq = 0 };
+    }
+    return .{ .ms = id.ms, .seq = id.seq + 1 };
+}
+
+fn parseXreadStart(s: []const u8) !StreamEntryId {
+    // if (std.mem.eql(u8, s, "$")) return .last;
+    if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
+        const ms = try std.fmt.parseInt(u64, s[0..dash], 10);
+        const seq = try std.fmt.parseInt(u64, s[dash + 1 ..], 10);
+        return .{ .id = .{ .ms = ms, .seq = seq } };
+    }
+    // Redis accepts bare "ms" and treats seq as 0.
+    const ms = try std.fmt.parseInt(u64, s, 10);
+    return .{ .id = .{ .ms = ms, .seq = 0 } };
 }
