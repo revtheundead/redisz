@@ -2,6 +2,7 @@ const std = @import("std");
 const resp = @import("resp.zig");
 const Store = @import("store.zig").Store;
 const StreamEntryId = @import("store.zig").StreamEntryId;
+const StreamRangeEntry = @import("store.zig").StreamRangeEntry;
 const Io = std.Io;
 
 fn nowMs(io: Io) i64 {
@@ -402,40 +403,83 @@ fn handleXrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, 
 }
 
 fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len != 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xread'");
-    const key = switch (args[2]) {
+    // XREAD STREAMS key1 [key2 ...] id1 [id2 ...]
+    // Future: COUNT n, BLOCK ms — both go between XREAD and STREAMS.
+    if (args.len < 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xread'");
+
+    const streams_kw = switch (args[1]) {
         .bulk_string => |m| m orelse return,
         else => return,
     };
-    const start_str = switch (args[3]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
+    if (!std.ascii.eqlIgnoreCase(streams_kw, "STREAMS")) {
+        return try resp.writeError(w, "ERR syntax error");
+    }
 
-    const start = parseXreadStart(start_str) catch return;
+    // Everything after STREAMS splits in half: N keys followed by N ids.
+    const rest = args[2..];
+    if (rest.len == 0 or rest.len % 2 != 0) {
+        return try resp.writeError(w, "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.");
+    }
+    const n = rest.len / 2;
 
-    const start_next = nextStreamId(start) orelse {
-        try resp.writeArrayHeader(w, 0);
-        return;
-    };
+    // Pull the arg strings out once so we don't re-unpack unions later.
+    const keys = try arena.alloc([]const u8, n);
+    const ids = try arena.alloc([]const u8, n);
+    for (rest[0..n], keys) |arg, *slot| {
+        slot.* = switch (arg) {
+            .bulk_string => |m| m orelse return,
+            else => return,
+        };
+    }
+    for (rest[n..], ids) |arg, *slot| {
+        slot.* = switch (arg) {
+            .bulk_string => |m| m orelse return,
+            else => return,
+        };
+    }
+
+    // Query all streams up front. Empty results are kept in place so indices
+    // line up with `keys`; we skip them during the write pass.
+    const now = nowMs(io);
     const max_id: StreamEntryId = .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
+    const per_stream = try arena.alloc([]const StreamRangeEntry, n);
+    var non_empty: usize = 0;
 
-    const entries = store.streamRange(io, arena, key, start_next, max_id, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
+    for (0..n) |i| {
+        const start = parseXreadStart(ids[i]) catch {
+            return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
+        };
+        const start_next = nextStreamId(start) orelse {
+            per_stream[i] = &.{};
+            continue;
+        };
+        per_stream[i] = store.streamRange(io, arena, keys[i], start_next, max_id, now) catch |err| switch (err) {
+            error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+            else => |e| return e,
+        };
+        if (per_stream[i].len > 0) non_empty += 1;
+    }
 
-    try resp.writeArrayHeader(w, 1); // 1 for now
-    try resp.writeArrayHeader(w, 2);
-    try resp.writeBulkString(w, key);
-    try resp.writeArrayHeader(w, entries.len);
+    // Real Redis omits empty streams from the reply and returns a null array
+    // when nothing has entries. Matching that keeps the wire format right for
+    // the blocking-XREAD stage later, where "nothing yet" needs to be
+    // distinguishable from "here's the data".
+    if (non_empty == 0) return try resp.writeNullArray(w);
+
+    try resp.writeArrayHeader(w, non_empty);
     var buf: [48]u8 = undefined;
-    for (entries) |entry| {
+    for (0..n) |i| {
+        if (per_stream[i].len == 0) continue;
         try resp.writeArrayHeader(w, 2);
-        const id_str = std.fmt.bufPrint(&buf, "{d}-{d}", .{ entry.id.ms, entry.id.seq }) catch unreachable;
-        try resp.writeBulkString(w, id_str);
-        try resp.writeArrayHeader(w, entry.fields.len);
-        for (entry.fields) |f| try resp.writeBulkString(w, f);
+        try resp.writeBulkString(w, keys[i]);
+        try resp.writeArrayHeader(w, per_stream[i].len);
+        for (per_stream[i]) |entry| {
+            try resp.writeArrayHeader(w, 2);
+            const id_str = std.fmt.bufPrint(&buf, "{d}-{d}", .{ entry.id.ms, entry.id.seq }) catch unreachable;
+            try resp.writeBulkString(w, id_str);
+            try resp.writeArrayHeader(w, entry.fields.len);
+            for (entry.fields) |f| try resp.writeBulkString(w, f);
+        }
     }
 }
 
