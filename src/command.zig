@@ -404,19 +404,36 @@ fn handleXrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, 
 
 fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
     // XREAD STREAMS key1 [key2 ...] id1 [id2 ...]
-    // Future: COUNT n, BLOCK ms — both go between XREAD and STREAMS.
     if (args.len < 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xread'");
 
-    const streams_kw = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    if (!std.ascii.eqlIgnoreCase(streams_kw, "STREAMS")) {
+    var block_ms: ?u64 = null;
+    var i: usize = 1;
+    while (i < args.len) {
+        const tok = switch (args[i]) {
+            .bulk_string => |m| m orelse return,
+            else => return,
+        };
+        if (std.ascii.eqlIgnoreCase(tok, "STREAMS")) break;
+        if (std.ascii.eqlIgnoreCase(tok, "BLOCK")) {
+            i += 1;
+            if (i >= args.len) return try resp.writeError(w, "ERR syntax error");
+            const ms_str = switch (args[i]) {
+                .bulk_string => |m| m orelse return,
+                else => return,
+            };
+            const parsed = std.fmt.parseInt(i64, ms_str, 10) catch {
+                return try resp.writeError(w, "ERR timeout is not an integer or out of range");
+            };
+            if (parsed < 0) return try resp.writeError(w, "ERR timeout is negative");
+            block_ms = @intCast(parsed);
+            i += 1;
+            continue;
+        }
         return try resp.writeError(w, "ERR syntax error");
     }
-
-    // Everything after STREAMS splits in half: N keys followed by N ids.
-    const rest = args[2..];
+    if (i >= args.len) return try resp.writeError(w, "ERR syntax error");
+    i += 1; // step past STREAMS
+    const rest = args[i..];
     if (rest.len == 0 or rest.len % 2 != 0) {
         return try resp.writeError(w, "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.");
     }
@@ -438,26 +455,51 @@ fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
         };
     }
 
-    // Query all streams up front. Empty results are kept in place so indices
-    // line up with `keys`; we skip them during the write pass.
-    const now = nowMs(io);
-    const max_id: StreamEntryId = .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
-    const per_stream = try arena.alloc([]const StreamRangeEntry, n);
-    var non_empty: usize = 0;
-
-    for (0..n) |i| {
-        const start = parseXreadStart(ids[i]) catch {
+    // Pre-compute successor IDs
+    const start_next = try arena.alloc(?StreamEntryId, n);
+    for (ids, start_next) |id_str, *slot| {
+        const parsed = parseXreadStart(id_str) catch {
             return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
         };
-        const start_next = nextStreamId(start) orelse {
-            per_stream[i] = &.{};
-            continue;
-        };
-        per_stream[i] = store.streamRange(io, arena, keys[i], start_next, max_id, now) catch |err| switch (err) {
-            error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-            else => |e| return e,
-        };
-        if (per_stream[i].len > 0) non_empty += 1;
+        slot.* = nextStreamId(parsed);
+    }
+
+    // Query all streams up front. Empty results are kept in place so indices
+    // line up with `keys`; we skip them during the write pass.
+    const max_id: StreamEntryId = .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
+    const per_stream = try arena.alloc([]const StreamRangeEntry, n);
+
+    const deadline_awake_ms: ?i64 = if (block_ms) |ms|
+        (if (ms == 0) null else Io.Clock.awake.now(io).toMilliseconds() + @as(i64, @intCast(ms)))
+    else
+        null;
+
+    var non_empty: usize = 0;
+    while (true) {
+        non_empty = 0;
+        const now = nowMs(io);
+        for (0..n) |k| {
+            const sn = start_next[k] orelse {
+                per_stream[k] = &.{};
+                continue;
+            };
+            per_stream[k] = store.streamRange(io, arena, keys[k], sn, max_id, now) catch |err| switch (err) {
+                error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+                else => |e| return e,
+            };
+            if (per_stream[k].len > 0) non_empty += 1;
+        }
+        if (non_empty > 0) break;
+        if (block_ms == null) break; // one-shot
+
+        const cur = Io.Clock.awake.now(io).toMilliseconds();
+        if (deadline_awake_ms) |dl| {
+            if (cur >= dl) break;
+            const remaining: u64 = @intCast(dl - cur);
+            try io.sleep(.fromMilliseconds(@min(50, remaining)), .awake);
+        } else {
+            try io.sleep(.fromMilliseconds(50), .awake);
+        }
     }
 
     // Real Redis omits empty streams from the reply and returns a null array
@@ -468,12 +510,12 @@ fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
 
     try resp.writeArrayHeader(w, non_empty);
     var buf: [48]u8 = undefined;
-    for (0..n) |i| {
-        if (per_stream[i].len == 0) continue;
+    for (0..n) |j| {
+        if (per_stream[j].len == 0) continue;
         try resp.writeArrayHeader(w, 2);
-        try resp.writeBulkString(w, keys[i]);
-        try resp.writeArrayHeader(w, per_stream[i].len);
-        for (per_stream[i]) |entry| {
+        try resp.writeBulkString(w, keys[j]);
+        try resp.writeArrayHeader(w, per_stream[j].len);
+        for (per_stream[j]) |entry| {
             try resp.writeArrayHeader(w, 2);
             const id_str = std.fmt.bufPrint(&buf, "{d}-{d}", .{ entry.id.ms, entry.id.seq }) catch unreachable;
             try resp.writeBulkString(w, id_str);
