@@ -457,11 +457,20 @@ fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
 
     // Pre-compute successor IDs
     const start_next = try arena.alloc(?StreamEntryId, n);
-    for (ids, start_next) |id_str, *slot| {
+    const now0 = nowMs(io);
+    for (ids, keys, start_next) |id_str, key, *slot| {
         const parsed = parseXreadStart(id_str) catch {
             return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
         };
-        slot.* = nextStreamId(parsed);
+
+        const base: StreamEntryId = switch (parsed) {
+            .explicit => |id| id,
+            .latest => (store.streamLastId(io, key, now0) catch |err| switch (err) {
+                error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+                else => |e| return e,
+            }) orelse .{ .ms = 0, .seq = 0 },
+        };
+        slot.* = nextStreamId(base);
     }
 
     // Query all streams up front. Empty results are kept in place so indices
@@ -549,14 +558,19 @@ fn nextStreamId(id: StreamEntryId) ?StreamEntryId {
     return .{ .ms = id.ms, .seq = id.seq + 1 };
 }
 
-fn parseXreadStart(s: []const u8) !StreamEntryId {
-    // if (std.mem.eql(u8, s, "$")) return .last;
+const XreadStart = union(enum) {
+    explicit: StreamEntryId,
+    latest,
+};
+
+fn parseXreadStart(s: []const u8) !XreadStart {
+    if (std.mem.eql(u8, s, "$")) return .latest;
     if (std.mem.indexOfScalar(u8, s, '-')) |dash| {
         const ms = try std.fmt.parseInt(u64, s[0..dash], 10);
         const seq = try std.fmt.parseInt(u64, s[dash + 1 ..], 10);
-        return .{ .ms = ms, .seq = seq };
+        return .{ .explicit = .{ .ms = ms, .seq = seq } };
     }
     // Redis accepts bare "ms" and treats seq as 0.
     const ms = try std.fmt.parseInt(u64, s, 10);
-    return .{ .ms = ms, .seq = 0 };
+    return .{ .explicit = .{ .ms = ms, .seq = 0 } };
 }

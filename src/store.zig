@@ -574,4 +574,17 @@ pub const Store = struct {
 
         return out;
     }
+
+    pub fn streamLastId(self: *Store, io: Io, key: []const u8, now_ms: i64) GetError!?StreamEntryId {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+
+        const entry_ptr = self.getLiveEntry(key, now_ms) orelse return null;
+        const stream = switch (entry_ptr.value) {
+            .stream => |s| s,
+            else => return error.WrongType,
+        };
+        if (stream.items.len == 0) return null;
+        return stream.items[stream.items.len - 1].id;
+    }
 };
