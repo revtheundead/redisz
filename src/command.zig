@@ -52,6 +52,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleXrange(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "XREAD")) {
         try handleXread(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "INCR")) {
+        try handleIncr(io, arena, w, store, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -573,4 +575,34 @@ fn parseXreadStart(s: []const u8) !XreadStart {
     // Redis accepts bare "ms" and treats seq as 0.
     const ms = try std.fmt.parseInt(u64, s, 10);
     return .{ .explicit = .{ .ms = ms, .seq = 0 } };
+}
+
+fn handleIncr(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+    if (args.len != 2) return try resp.writeError(w, "ERR wrong number of arguments for 'incr'");
+    const key = switch (args[1]) {
+        .bulk_string => |m| m orelse return,
+        else => return,
+    };
+
+    const maybe_val = store.get(io, arena, key, nowMs(io)) catch |err| switch (err) {
+        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
+        else => |e| return e,
+    };
+
+    const cur: i64 = if (maybe_val) |s|
+        (std.fmt.parseInt(i64, s, 10) catch {
+            return try resp.writeError(w, "ERR value is not an integer or out of range");
+        })
+    else
+        0;
+
+    const res = std.math.add(i64, cur, 1) catch {
+        return try resp.writeError(w, "ERR increment or decrement would overflow");
+    };
+
+    // max i64 is 19 digits + sign = 20 digits
+    var buf: [20]u8 = undefined;
+    const res_str = std.fmt.bufPrint(&buf, "{d}", .{res}) catch unreachable;
+    try store.set(io, key, res_str, null);
+    try resp.writeInteger(w, res);
 }
