@@ -54,6 +54,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleXread(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "INCR")) {
         try handleIncr(io, arena, w, store, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "MULTI")) {
+        try handleMulti(w, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -605,4 +607,9 @@ fn handleIncr(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, ar
     const res_str = std.fmt.bufPrint(&buf, "{d}", .{res}) catch unreachable;
     try store.set(io, key, res_str, null);
     try resp.writeInteger(w, res);
+}
+
+fn handleMulti(w: *Io.Writer, args: []const resp.Value) !void {
+    if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'multi'");
+    try resp.writeSimpleString(w, "OK");
 }

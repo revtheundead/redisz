@@ -4,6 +4,25 @@ const Store = @import("store.zig").Store;
 const command = @import("command.zig");
 const Io = std.Io;
 
+const QueuedCommand = struct {
+    // Deep gpa copy of the parsed args: outer slice + inner slice.
+    // Lives from MULTI until EXEC (or DISCARD) frees it.
+    args: []const []const u8,
+};
+
+const ClientState = struct {
+    in_multi: bool = false,
+    queued: std.ArrayListUnmanaged(QueuedCommand) = .empty,
+
+    fn deinit(self: *ClientState, gpa: std.mem.Allocator) void {
+        for (self.queued.items) |cmd| {
+            for (cmd.args) |a| gpa.free(a);
+            gpa.free(cmd.args);
+        }
+        self.queued.deinit(gpa);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
