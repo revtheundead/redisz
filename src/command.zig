@@ -56,6 +56,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleIncr(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "MULTI")) {
         try handleMulti(w, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "EXEC")) {
+        try handleExec(w, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -612,4 +614,9 @@ fn handleIncr(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, ar
 fn handleMulti(w: *Io.Writer, args: []const resp.Value) !void {
     if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'multi'");
     try resp.writeSimpleString(w, "OK");
+}
+
+fn handleExec(w: *Io.Writer, args: []const resp.Value) !void {
+    if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'exec'");
+    return try resp.writeError(w, "ERR EXEC without MULTI");
 }
