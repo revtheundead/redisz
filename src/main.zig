@@ -4,13 +4,13 @@ const Store = @import("store.zig").Store;
 const command = @import("command.zig");
 const Io = std.Io;
 
-const QueuedCommand = struct {
+pub const QueuedCommand = struct {
     // Deep gpa copy of the parsed args: outer slice + inner slice.
     // Lives from MULTI until EXEC (or DISCARD) frees it.
     args: []const []const u8,
 };
 
-const ClientState = struct {
+pub const ClientState = struct {
     in_multi: bool = false,
     queued: std.ArrayListUnmanaged(QueuedCommand) = .empty,
 
@@ -55,6 +55,8 @@ fn handleClient(io: Io, stream: Io.net.Stream, store: *Store) Io.Cancelable!void
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    var client: ClientState = .{};
+
     var read_buf: [4096]u8 = undefined;
     var stream_reader = stream.reader(io, &read_buf);
     var stream_writer = stream.writer(io, &.{});
@@ -71,6 +73,6 @@ fn handleClient(io: Io, stream: Io.net.Stream, store: *Store) Io.Cancelable!void
             else => break,
         };
 
-        command.dispatch(io, arena, store, &stream_writer.interface, value) catch break;
+        command.dispatch(io, arena, store, &stream_writer.interface, value, &client) catch break;
     }
 }

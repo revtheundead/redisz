@@ -3,6 +3,7 @@ const resp = @import("resp.zig");
 const Store = @import("store.zig").Store;
 const StreamEntryId = @import("store.zig").StreamEntryId;
 const StreamRangeEntry = @import("store.zig").StreamRangeEntry;
+const ClientState = @import("main.zig").ClientState;
 const Io = std.Io;
 
 fn nowMs(io: Io) i64 {
@@ -12,7 +13,7 @@ fn nowMs(io: Io) i64 {
 // Top-level command router. Reads args[0] and dispatches to a handler.
 // An if/else chain is fine up to ~20 commands; when we outgrow it we'll swap
 // in a comptime StaticStringMap.
-pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, value: resp.Value) !void {
+pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, value: resp.Value, client: *ClientState) !void {
     const args = switch (value) {
         .array => |maybe| maybe orelse return,
         else => return,
@@ -55,9 +56,9 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
     } else if (std.ascii.eqlIgnoreCase(cmd, "INCR")) {
         try handleIncr(io, arena, w, store, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "MULTI")) {
-        try handleMulti(w, args);
+        try handleMulti(w, client, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "EXEC")) {
-        try handleExec(w, args);
+        try handleExec(w, client, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -611,12 +612,16 @@ fn handleIncr(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, ar
     try resp.writeInteger(w, res);
 }
 
-fn handleMulti(w: *Io.Writer, args: []const resp.Value) !void {
+fn handleMulti(w: *Io.Writer, client: *ClientState, args: []const resp.Value) !void {
     if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'multi'");
+    if (client.in_multi) return try resp.writeError(w, "ERR MULTI calls can not be nested");
+    client.in_multi = true;
     try resp.writeSimpleString(w, "OK");
 }
 
-fn handleExec(w: *Io.Writer, args: []const resp.Value) !void {
+fn handleExec(w: *Io.Writer, client: *ClientState, args: []const resp.Value) !void {
     if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'exec'");
-    return try resp.writeError(w, "ERR EXEC without MULTI");
+    if (!client.in_multi) return try resp.writeError(w, "ERR EXEC without MULTI");
+    client.in_multi = false;
+    try resp.writeArrayHeader(w, 0);
 }
