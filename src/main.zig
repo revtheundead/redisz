@@ -5,8 +5,8 @@ const command = @import("command.zig");
 const Io = std.Io;
 
 pub const QueuedCommand = struct {
-    // Deep gpa copy of the parsed args: outer slice + inner slice.
-    // Lives from MULTI until EXEC (or DISCARD) frees it.
+    // Deep gpa copy of args from the client. Outer slice owned by gpa; each
+    // inner slice owned by gpa. Freed by ClientState.clearQueue.
     args: []const []const u8,
 };
 
@@ -14,11 +14,16 @@ pub const ClientState = struct {
     in_multi: bool = false,
     queued: std.ArrayListUnmanaged(QueuedCommand) = .empty,
 
-    fn deinit(self: *ClientState, gpa: std.mem.Allocator) void {
+    pub fn clearQueue(self: *ClientState, gpa: std.mem.Allocator) void {
         for (self.queued.items) |cmd| {
             for (cmd.args) |a| gpa.free(a);
             gpa.free(cmd.args);
         }
+        self.queued.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *ClientState, gpa: std.mem.Allocator) void {
+        self.clearQueue(gpa);
         self.queued.deinit(gpa);
     }
 };
@@ -56,6 +61,7 @@ fn handleClient(io: Io, stream: Io.net.Stream, store: *Store) Io.Cancelable!void
     const arena = arena_state.allocator();
 
     var client: ClientState = .{};
+    defer client.deinit(store.gpa);
 
     var read_buf: [4096]u8 = undefined;
     var stream_reader = stream.reader(io, &read_buf);

@@ -10,6 +10,30 @@ fn nowMs(io: Io) i64 {
     return Io.Clock.real.now(io).toMilliseconds();
 }
 
+fn isTxnControl(cmd: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(cmd, "MULTI") or std.ascii.eqlIgnoreCase(cmd, "EXEC") or std.ascii.eqlIgnoreCase(cmd, "DISCARD");
+}
+
+fn enqueueCommand(gpa: std.mem.Allocator, client: *ClientState, args: []const resp.Value) !void {
+    // Two-phase to keep the queue consistent on OOM: allocate + dupe first,
+    // append only when every dupe has succeeded
+    const dup_args = try gpa.alloc([]const u8, args.len);
+    errdefer gpa.free(dup_args);
+
+    var duped: usize = 0;
+    errdefer for (dup_args[0..duped]) |a| gpa.free(a);
+
+    while (duped < args.len) : (duped += 1) {
+        const raw = switch (args[duped]) {
+            .bulk_string => |m| m orelse return error.InvalidCommand,
+            else => return error.InvalidCommand,
+        };
+        dup_args[duped] = try gpa.dupe(u8, raw);
+    }
+
+    try client.queued.append(gpa, .{ .args = dup_args });
+}
+
 // Top-level command router. Reads args[0] and dispatches to a handler.
 // An if/else chain is fine up to ~20 commands; when we outgrow it we'll swap
 // in a comptime StaticStringMap.
@@ -24,6 +48,11 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         .bulk_string => |maybe| maybe orelse return,
         else => return,
     };
+
+    if (client.in_multi and !isTxnControl(cmd)) {
+        try enqueueCommand(store.gpa, client, args);
+        return try resp.writeSimpleString(w, "QUEUED");
+    }
 
     if (std.ascii.eqlIgnoreCase(cmd, "PING")) {
         try handlePing(w);
@@ -58,7 +87,9 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
     } else if (std.ascii.eqlIgnoreCase(cmd, "MULTI")) {
         try handleMulti(w, client, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "EXEC")) {
-        try handleExec(w, client, args);
+        try handleExec(io, arena, w, store, client, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "DISCARD")) {
+        try handleDiscard(w, store, client, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -619,9 +650,33 @@ fn handleMulti(w: *Io.Writer, client: *ClientState, args: []const resp.Value) !v
     try resp.writeSimpleString(w, "OK");
 }
 
-fn handleExec(w: *Io.Writer, client: *ClientState, args: []const resp.Value) !void {
+fn handleExec(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) anyerror!void {
     if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'exec'");
     if (!client.in_multi) return try resp.writeError(w, "ERR EXEC without MULTI");
+
+    // Order matters: clear in_multi BEFORE re-dispatching, so the intercept
+    // above doesn't re-fire on the queued commands. defer the queue cleanup
+    // so a mid-loop error still leaves ClientState in a clean state (the
+    // connection's deinit would double-free otherwise).
     client.in_multi = false;
-    try resp.writeArrayHeader(w, 0);
+    defer client.clearQueue(store.gpa);
+
+    try resp.writeArrayHeader(w, client.queued.items.len);
+    for (client.queued.items) |cmd| {
+        // Wrap the raw gpa-owned args back into resp.Value shape so we can
+        // re-enter dispatch. The wrapper array lives in the arena; the
+        // inner slices still point into the queue's gpa storage (safe: the
+        // defer above fires only after the loop finishes).
+        const wrapped = try arena.alloc(resp.Value, cmd.args.len);
+        for (cmd.args, wrapped) |raw, *slot| slot.* = .{ .bulk_string = raw };
+        try dispatch(io, arena, store, w, .{ .array = wrapped }, client);
+    }
+}
+
+fn handleDiscard(w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) !void {
+    if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'discard'");
+    if (!client.in_multi) return try resp.writeError(w, "ERR DISCARD without MULTI");
+    client.clearQueue(store.gpa);
+    client.in_multi = false;
+    try resp.writeSimpleString(w, "OK");
 }
