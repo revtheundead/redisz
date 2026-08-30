@@ -10,9 +10,15 @@ pub const QueuedCommand = struct {
     args: []const []const u8,
 };
 
+pub const WatchedKey = struct {
+    key: []const u8, // gpa-owned dupe; freed by ClientState.clearWatch
+    version: u64, // store.watchVersion captured at WATCH time
+};
+
 pub const ClientState = struct {
     in_multi: bool = false,
     queued: std.ArrayListUnmanaged(QueuedCommand) = .empty,
+    watched: std.ArrayListUnmanaged(WatchedKey) = .empty,
 
     pub fn clearQueue(self: *ClientState, gpa: std.mem.Allocator) void {
         for (self.queued.items) |cmd| {
@@ -22,9 +28,16 @@ pub const ClientState = struct {
         self.queued.clearRetainingCapacity();
     }
 
+    pub fn clearWatch(self: *ClientState, gpa: std.mem.Allocator) void {
+        for (self.watched.items) |wk| gpa.free(wk.key);
+        self.watched.clearRetainingCapacity();
+    }
+
     fn deinit(self: *ClientState, gpa: std.mem.Allocator) void {
         self.clearQueue(gpa);
         self.queued.deinit(gpa);
+        self.clearWatch(gpa);
+        self.watched.deinit(gpa);
     }
 };
 

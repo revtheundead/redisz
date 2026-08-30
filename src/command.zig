@@ -50,6 +50,8 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
     };
 
     if (client.in_multi and !isTxnControl(cmd)) {
+        if (std.ascii.eqlIgnoreCase(cmd, "WATCH"))
+            return try resp.writeError(w, "ERR WATCH inside MULTI is not allowed");
         try enqueueCommand(store.gpa, client, args);
         return try resp.writeSimpleString(w, "QUEUED");
     }
@@ -90,6 +92,10 @@ pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, 
         try handleExec(io, arena, w, store, client, args);
     } else if (std.ascii.eqlIgnoreCase(cmd, "DISCARD")) {
         try handleDiscard(w, store, client, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "WATCH")) {
+        try handleWatch(io, w, store, client, args);
+    } else if (std.ascii.eqlIgnoreCase(cmd, "UNWATCH")) {
+        try handleUnwatch(w, store, client, args);
     } else {
         try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
     }
@@ -660,6 +666,13 @@ fn handleExec(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, cl
     // connection's deinit would double-free otherwise).
     client.in_multi = false;
     defer client.clearQueue(store.gpa);
+    defer client.clearWatch(store.gpa); // watches always flushed after EXEC
+
+    // Optimistic-lock gate: if any watched key changed since WATCH, the whole
+    // transaction is discarded and EXEC replies with a null array.
+    if (try watchDirty(io, store, client)) {
+        return try resp.writeNullArray(w);
+    }
 
     try resp.writeArrayHeader(w, client.queued.items.len);
     for (client.queued.items) |cmd| {
@@ -673,10 +686,46 @@ fn handleExec(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, cl
     }
 }
 
+// True if any watched key's current version differs from what WATCH recorded.
+fn watchDirty(io: Io, store: *Store, client: *ClientState) !bool {
+    const now = nowMs(io);
+    for (client.watched.items) |wk| {
+        const current = try store.watchVersion(io, wk.key, now);
+        if (current != wk.version) return true;
+    }
+    return false;
+}
+
 fn handleDiscard(w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) !void {
     if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'discard'");
     if (!client.in_multi) return try resp.writeError(w, "ERR DISCARD without MULTI");
     client.clearQueue(store.gpa);
+    client.clearWatch(store.gpa);
     client.in_multi = false;
+    try resp.writeSimpleString(w, "OK");
+}
+
+fn handleWatch(io: Io, w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) !void {
+    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'watch'");
+
+    const now = nowMs(io);
+    for (args[1..]) |arg| {
+        const key = switch (arg) {
+            .bulk_string => |m| m orelse return,
+            else => return,
+        };
+        const version = try store.watchVersion(io, key, now);
+
+        // Key must outlive this dispatch (freed at EXEC/DISCARD/UNWATCH)
+        const key_copy = try store.gpa.dupe(u8, key);
+        errdefer store.gpa.free(key_copy);
+        try client.watched.append(store.gpa, .{ .key = key_copy, .version = version });
+    }
+    try resp.writeSimpleString(w, "OK");
+}
+
+fn handleUnwatch(w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) !void {
+    if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'unwatch'");
+    client.clearWatch(store.gpa);
     try resp.writeSimpleString(w, "OK");
 }

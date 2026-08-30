@@ -57,12 +57,17 @@ pub const Store = struct {
     // Per-key FIFO of blocked clients. Empty entries are removed when the last
     // waiter for a key is dequeued (see dequeueWaiter).
     waiters: std.StringHashMapUnmanaged(std.DoublyLinkedList),
+    // Monotonic modification stamp. Bumped on every key mutation; a key's
+    // Entry records the value at its last write. WATCH/EXEC compare these to
+    // detect concurrent modification (optimistic locking).
+    mutation_seq: u64 = 0,
 
     pub const Side = enum { head, tail };
 
     const Entry = struct {
         value: StoredValue,
         expires_at_ms: ?i64,
+        version: u64, // mutation_seq at this key's last write
     };
 
     // A parked BLPOP client. Lives on the caller's stack, the handler task
@@ -132,6 +137,12 @@ pub const Store = struct {
         return entry_ptr;
     }
 
+    // Caller must hold self.mutex. Next global modification stamp.
+    fn nextVersion(self: *Store) u64 {
+        self.mutation_seq += 1;
+        return self.mutation_seq;
+    }
+
     // SET overwrites any prior value regardless of prior type.
     pub fn set(self: *Store, io: Io, key: []const u8, value: []const u8, expires_at_ms: ?i64) !void {
         const key_copy = try self.gpa.dupe(u8, key);
@@ -147,7 +158,7 @@ pub const Store = struct {
             self.gpa.free(key_copy);
             freeValue(self.gpa, gop.value_ptr.value);
         }
-        gop.value_ptr.* = .{ .value = .{ .string = value_copy }, .expires_at_ms = expires_at_ms };
+        gop.value_ptr.* = .{ .value = .{ .string = value_copy }, .expires_at_ms = expires_at_ms, .version = self.nextVersion() };
     }
 
     // Returns an arena-owned copy of the string value.
@@ -163,6 +174,18 @@ pub const Store = struct {
             .string => |s| try out_arena.dupe(u8, s),
             else => error.WrongType,
         };
+    }
+
+    // Optimistic-locking stamp for a key.
+    //   0        → key absent or expired
+    //   non-zero → mutation_seq at the key's last write
+    // Note: getLiveEntry may lazily expire the key here, which correctly
+    // surfaces as version 0 (differs from any prior non-zero watch).
+    pub fn watchVersion(self: *Store, io: Io, key: []const u8, now_ms: i64) Io.Cancelable!u64 {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        const entry = self.getLiveEntry(key, now_ms) orelse return 0;
+        return entry.version;
     }
 
     // Returns the RESP type tag ("string", "list", ...) or null if the key
@@ -182,10 +205,10 @@ pub const Store = struct {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
 
-        var list_ptr: *List = undefined;
-        if (self.getLiveEntry(key, now_ms)) |entry_ptr| {
-            switch (entry_ptr.value) {
-                .list => |*l| list_ptr = l,
+        var entry_ptr: *Entry = undefined;
+        if (self.getLiveEntry(key, now_ms)) |ep| {
+            switch (ep.value) {
+                .list => entry_ptr = ep,
                 else => return error.WrongType,
             }
         } else {
@@ -193,9 +216,10 @@ pub const Store = struct {
             errdefer self.gpa.free(key_copy);
 
             const gop = try self.map.getOrPut(self.gpa, key_copy);
-            gop.value_ptr.* = .{ .value = .{ .list = .empty }, .expires_at_ms = null };
-            list_ptr = &gop.value_ptr.value.list;
+            gop.value_ptr.* = .{ .value = .{ .list = .empty }, .expires_at_ms = null, .version = 0 };
+            entry_ptr = gop.value_ptr;
         }
+        const list_ptr = &entry_ptr.value.list;
 
         switch (side) {
             .tail => {
@@ -218,6 +242,7 @@ pub const Store = struct {
                 }
             },
         }
+        entry_ptr.version = self.nextVersion();
 
         // RPUSH/LPUSH report the length after append. BLPOP handoff below is a
         // separate event that doesn't refund the push count.
@@ -295,6 +320,14 @@ pub const Store = struct {
                         for (list.items[available - n ..]) |elem| self.gpa.free(elem);
                         list.items.len -= n;
                     },
+                }
+
+                if (list.items.len == 0) {
+                    const kv = self.map.fetchSwapRemove(key).?;
+                    self.gpa.free(kv.key);
+                    freeValue(self.gpa, kv.value.value);
+                } else if (n > 0) {
+                    entry.version = self.nextVersion();
                 }
 
                 // Delete-on-empty. Same invariant as single-element listPop.
@@ -417,6 +450,8 @@ pub const Store = struct {
                             const kv = self.map.fetchSwapRemove(key).?;
                             self.gpa.free(kv.key);
                             freeValue(self.gpa, kv.value.value);
+                        } else {
+                            entry_ptr.version = self.nextVersion();
                         }
                         return .{ .key = out_key, .value = out_value };
                     }
@@ -481,10 +516,10 @@ pub const Store = struct {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
 
-        var stream_ptr: *Stream = undefined;
-        if (self.getLiveEntry(key, now_ms)) |entry_ptr| {
-            switch (entry_ptr.value) {
-                .stream => |*s| stream_ptr = s,
+        var entry_ptr: *Entry = undefined;
+        if (self.getLiveEntry(key, now_ms)) |ep| {
+            switch (ep.value) {
+                .stream => entry_ptr = ep,
                 else => return error.WrongType,
             }
         } else {
@@ -492,9 +527,10 @@ pub const Store = struct {
             errdefer self.gpa.free(key_copy);
 
             const gop = try self.map.getOrPut(self.gpa, key_copy);
-            gop.value_ptr.* = .{ .value = .{ .stream = .empty }, .expires_at_ms = null };
-            stream_ptr = &gop.value_ptr.value.stream;
+            gop.value_ptr.* = .{ .value = .{ .stream = .empty }, .expires_at_ms = null, .version = 0 };
+            entry_ptr = gop.value_ptr;
         }
+        const stream_ptr = &entry_ptr.value.stream;
 
         // Resolve the id spec against the last entry (if any) and validate.
         // Errors here return without touching the stream, the errordefers up top
@@ -507,6 +543,7 @@ pub const Store = struct {
         const id = try resolveStreamId(id_spec, last, now_ms);
 
         try stream_ptr.append(self.gpa, .{ .id = id, .fields = fields_copy });
+        entry_ptr.version = self.nextVersion();
         return id;
     }
 
