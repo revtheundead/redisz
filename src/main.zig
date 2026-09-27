@@ -4,12 +4,6 @@ const Store = @import("store.zig").Store;
 const command = @import("command.zig");
 const Io = std.Io;
 
-pub const QueuedCommand = struct {
-    // Deep gpa copy of args from the client. Outer slice owned by gpa; each
-    // inner slice owned by gpa. Freed by ClientState.clearQueue.
-    args: []const []const u8,
-};
-
 pub const WatchedKey = struct {
     key: []const u8, // gpa-owned dupe; freed by ClientState.clearWatch
     version: u64, // store.watchVersion captured at WATCH time
@@ -17,15 +11,23 @@ pub const WatchedKey = struct {
 
 pub const ClientState = struct {
     in_multi: bool = false,
-    queued: std.ArrayListUnmanaged(QueuedCommand) = .empty,
+    // Set when a command is rejected while queuing (unknown command, wrong
+    // arity). EXEC then discards the whole transaction, like Redis.
+    multi_failed: bool = false,
+    // Deep gpa copies of each queued command's args. Freed by resetMulti.
+    queued: std.ArrayListUnmanaged([]const []const u8) = .empty,
     watched: std.ArrayListUnmanaged(WatchedKey) = .empty,
 
-    pub fn clearQueue(self: *ClientState, gpa: std.mem.Allocator) void {
-        for (self.queued.items) |cmd| {
-            for (cmd.args) |a| gpa.free(a);
-            gpa.free(cmd.args);
+    // Leaves MULTI mode and drops the queue. Watches are separate, since
+    // they're set before MULTI and cleared by EXEC/DISCARD/UNWATCH.
+    pub fn resetMulti(self: *ClientState, gpa: std.mem.Allocator) void {
+        for (self.queued.items) |args| {
+            for (args) |a| gpa.free(a);
+            gpa.free(args);
         }
         self.queued.clearRetainingCapacity();
+        self.in_multi = false;
+        self.multi_failed = false;
     }
 
     pub fn clearWatch(self: *ClientState, gpa: std.mem.Allocator) void {
@@ -34,7 +36,7 @@ pub const ClientState = struct {
     }
 
     fn deinit(self: *ClientState, gpa: std.mem.Allocator) void {
-        self.clearQueue(gpa);
+        self.resetMulti(gpa);
         self.queued.deinit(gpa);
         self.clearWatch(gpa);
         self.watched.deinit(gpa);
@@ -92,6 +94,23 @@ fn handleClient(io: Io, stream: Io.net.Stream, store: *Store) Io.Cancelable!void
             else => break,
         };
 
-        command.dispatch(io, arena, store, &stream_writer.interface, value, &client) catch break;
+        // Commands execute one at a time under the store mutex, our stand-in
+        // for Redis's single execution thread. The reply is built in memory
+        // and sent after unlocking, so a slow client can't stall the rest.
+        var reply: Io.Writer.Allocating = .init(arena);
+        var ctx: command.Context = .{
+            .io = io,
+            .arena = arena,
+            .store = store,
+            .w = &reply.writer,
+            .client = &client,
+        };
+
+        try store.mutex.lock(io);
+        const result = command.dispatch(&ctx, value);
+        store.mutex.unlock(io);
+        result catch break;
+
+        stream_writer.interface.writeAll(reply.written()) catch break;
     }
 }

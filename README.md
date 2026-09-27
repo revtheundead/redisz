@@ -1,33 +1,24 @@
 [![progress-banner](https://backend.codecrafters.io/progress/redis/b27a5d4d-c9ed-49c7-8ac3-a356437a21b4)](https://app.codecrafters.io/users/revtheundead?r=2qF)
 
-This is a starting point for Zig solutions to the
-["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
+# redisz
 
-In this challenge, you'll build a toy Redis clone that's capable of handling
-basic commands like `PING`, `SET` and `GET`. Along the way we'll learn about
-event loops, the Redis protocol and more.
+A small Redis server written in Zig 0.16, built for the
+["Build Your Own Redis" challenge](https://codecrafters.io/challenges/redis) on CodeCrafters.
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+Supports strings (with expiry), lists (including `BLPOP`), streams, `INCR`,
+and transactions with `MULTI` / `EXEC` / `WATCH`.
 
-# Passing the first stage
-
-The entry point for your Redis implementation is in `src/main.zig`. Study and
-uncomment the relevant code, then run the command below to execute the tests on
-our servers:
+## Running
 
 ```sh
-codecrafters submit
+./your_program.sh
 ```
 
-That's all!
+The server listens on port 6379.
 
-# Stage 2 & beyond
+## Layout
 
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `zig (0.16)` installed locally
-1. Run `./your_program.sh` to run your Redis server, which is implemented in
-   `src/main.zig`.
-1. Run `codecrafters submit` to submit your solution to CodeCrafters. Test
-   output will be streamed to your terminal.
+- `src/main.zig`: accepts connections and runs the per-client loop
+- `src/resp.zig`: RESP protocol parsing and reply writing
+- `src/command.zig`: the command table and handlers
+- `src/store.zig`: the in-memory keyspace

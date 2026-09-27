@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-pub const GetError = error{WrongType} || std.mem.Allocator.Error || Io.Cancelable;
+pub const GetError = error{WrongType} || std.mem.Allocator.Error;
 
 // Redis list backing. ArrayList gives O(1) tail-push and O(1) LINDEX, at the cost
 // of O(n) head-push. Real Redis uses a quicklist (linked list of listpacks);
@@ -30,6 +30,8 @@ pub const StreamIdSpec = union(enum) {
 
 pub const StreamAddError = error{ IdEqualOrSmaller, IdZero } || GetError;
 
+pub const IncrError = error{ NotInteger, Overflow } || GetError;
+
 pub const StreamEntry = struct {
     id: StreamEntryId, // gpa owned
     fields: [][]const u8, // flat [k0, v0, k1, v1, ...], each gpa owned
@@ -42,14 +44,18 @@ pub const StreamRangeEntry = struct {
     fields: []const []const u8,
 };
 
-// Discriminated payload for a key. String is the only variant today; list, stream,
-// hash and zset will land as their Codecrafters sections start.
+// Discriminated payload for a key. Hash and zset will land as their
+// Codecrafters sections start.
 pub const StoredValue = union(enum) {
     string: []const u8,
     list: List,
     stream: Stream,
 };
 
+// Every method assumes the caller holds `mutex`. The connection loop takes it
+// around each command, so commands execute one at a time, like the single
+// execution thread in real Redis. Only the blocking commands release it, while
+// they wait.
 pub const Store = struct {
     gpa: std.mem.Allocator,
     map: std.StringArrayHashMapUnmanaged(Entry),
@@ -122,36 +128,49 @@ pub const Store = struct {
         }
     }
 
-    // Caller must hold self.mutex. Runs lazy expiration and returns a pointer
-    // to a live entry, or null when the key is absent or just evicted.
+    // Runs lazy expiration and returns a pointer to a live entry, or null
+    // when the key is absent or just evicted.
     fn getLiveEntry(self: *Store, key: []const u8, now_ms: i64) ?*Entry {
         const entry_ptr = self.map.getPtr(key) orelse return null;
         if (entry_ptr.expires_at_ms) |deadline| {
             if (now_ms >= deadline) {
-                const kv = self.map.fetchSwapRemove(key).?;
-                self.gpa.free(kv.key);
-                freeValue(self.gpa, kv.value.value);
+                self.removeKey(key);
                 return null;
             }
         }
         return entry_ptr;
     }
 
-    // Caller must hold self.mutex. Next global modification stamp.
+    // Deletes `key` and frees its storage. No-op if absent. Any *Entry
+    // obtained before this call is invalid afterwards (swapRemove moves
+    // another entry into the freed slot).
+    fn removeKey(self: *Store, key: []const u8) void {
+        const kv = self.map.fetchSwapRemove(key) orelse return;
+        self.gpa.free(kv.key);
+        freeValue(self.gpa, kv.value.value);
+    }
+
+    // Next global modification stamp.
     fn nextVersion(self: *Store) u64 {
         self.mutation_seq += 1;
         return self.mutation_seq;
     }
 
+    // Releases the mutex for `ms` so other clients can run, then takes it
+    // back. Used by the polling waits in BLPOP (with timeout) and XREAD
+    // BLOCK. Always returns with the mutex held, even when canceled.
+    pub fn sleepUnlocked(self: *Store, io: Io, ms: u64) Io.Cancelable!void {
+        self.mutex.unlock(io);
+        defer self.mutex.lockUncancelable(io);
+        try io.sleep(.fromMilliseconds(@intCast(ms)), .awake);
+    }
+
     // SET overwrites any prior value regardless of prior type.
-    pub fn set(self: *Store, io: Io, key: []const u8, value: []const u8, expires_at_ms: ?i64) !void {
+    pub fn set(self: *Store, key: []const u8, value: []const u8, expires_at_ms: ?i64) !void {
         const key_copy = try self.gpa.dupe(u8, key);
         errdefer self.gpa.free(key_copy);
         const value_copy = try self.gpa.dupe(u8, value);
         errdefer self.gpa.free(value_copy);
-
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
 
         const gop = try self.map.getOrPut(self.gpa, key_copy);
         if (gop.found_existing) {
@@ -163,11 +182,8 @@ pub const Store = struct {
 
     // Returns an arena-owned copy of the string value.
     //   null            → key absent or expired
-    //   WrongType       → key holds a non-string value (once other variants exist)
-    pub fn get(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, now_ms: i64) GetError!?[]const u8 {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
+    //   WrongType       → key holds a non-string value
+    pub fn get(self: *Store, out_arena: std.mem.Allocator, key: []const u8, now_ms: i64) GetError!?[]const u8 {
         const entry = self.getLiveEntry(key, now_ms) orelse return null;
 
         return switch (entry.value) {
@@ -176,24 +192,55 @@ pub const Store = struct {
         };
     }
 
+    // INCR/INCRBY/DECR/DECRBY core. Absent key counts as 0. An existing TTL
+    // is preserved; only the SET family resets expiry.
+    pub fn incrBy(self: *Store, key: []const u8, delta: i64, now_ms: i64) IncrError!i64 {
+        const maybe_entry = self.getLiveEntry(key, now_ms);
+        var cur: i64 = 0;
+        if (maybe_entry) |entry| {
+            cur = switch (entry.value) {
+                .string => |s| std.fmt.parseInt(i64, s, 10) catch return error.NotInteger,
+                else => return error.WrongType,
+            };
+        }
+
+        const res = std.math.add(i64, cur, delta) catch return error.Overflow;
+
+        // min i64 is 19 digits + sign = 20 bytes
+        var buf: [20]u8 = undefined;
+        const res_str = std.fmt.bufPrint(&buf, "{d}", .{res}) catch unreachable;
+        const value_copy = try self.gpa.dupe(u8, res_str);
+        errdefer self.gpa.free(value_copy);
+
+        if (maybe_entry) |entry| {
+            self.gpa.free(entry.value.string);
+            entry.value = .{ .string = value_copy };
+            entry.version = self.nextVersion();
+        } else {
+            const key_copy = try self.gpa.dupe(u8, key);
+            errdefer self.gpa.free(key_copy);
+            try self.map.put(self.gpa, key_copy, .{
+                .value = .{ .string = value_copy },
+                .expires_at_ms = null,
+                .version = self.nextVersion(),
+            });
+        }
+        return res;
+    }
+
     // Optimistic-locking stamp for a key.
     //   0        → key absent or expired
     //   non-zero → mutation_seq at the key's last write
     // Note: getLiveEntry may lazily expire the key here, which correctly
     // surfaces as version 0 (differs from any prior non-zero watch).
-    pub fn watchVersion(self: *Store, io: Io, key: []const u8, now_ms: i64) Io.Cancelable!u64 {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
+    pub fn watchVersion(self: *Store, key: []const u8, now_ms: i64) u64 {
         const entry = self.getLiveEntry(key, now_ms) orelse return 0;
         return entry.version;
     }
 
     // Returns the RESP type tag ("string", "list", ...) or null if the key
     // is absent/expired. Callers translate null to "none" for the TYPE command.
-    pub fn getType(self: *Store, io: Io, key: []const u8, now_ms: i64) Io.Cancelable!?[]const u8 {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
+    pub fn getType(self: *Store, key: []const u8, now_ms: i64) ?[]const u8 {
         const entry = self.getLiveEntry(key, now_ms) orelse return null;
         return @tagName(entry.value);
     }
@@ -202,9 +249,6 @@ pub const Store = struct {
     // the key is absent/expired. WrongType if the key holds a non-list value.
     // Returns the new list length.
     pub fn listPush(self: *Store, io: Io, key: []const u8, values: []const []const u8, side: Side, now_ms: i64) GetError!usize {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
         var entry_ptr: *Entry = undefined;
         if (self.getLiveEntry(key, now_ms)) |ep| {
             switch (ep.value) {
@@ -264,11 +308,7 @@ pub const Store = struct {
         }
 
         // Delete-on-empty uses actual final length.
-        if (list_ptr.items.len == 0) {
-            const kv = self.map.fetchSwapRemove(key).?;
-            self.gpa.free(kv.key);
-            freeValue(self.gpa, kv.value.value);
-        }
+        if (list_ptr.items.len == 0) self.removeKey(key);
 
         return push_length;
     }
@@ -280,10 +320,7 @@ pub const Store = struct {
     // Popped elements are arena-owned; the store's copies are freed. When
     // the pop empties the list, the key is deleted (Redis's "no empty
     // collections" invariant).
-    pub fn listPop(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, count: usize, side: Side, now_ms: i64) GetError!?[]const []const u8 {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
+    pub fn listPop(self: *Store, out_arena: std.mem.Allocator, key: []const u8, count: usize, side: Side, now_ms: i64) GetError!?[]const []const u8 {
         const entry = self.getLiveEntry(key, now_ms) orelse return null;
         switch (entry.value) {
             .list => |*list| {
@@ -322,19 +359,12 @@ pub const Store = struct {
                     },
                 }
 
+                // Delete-on-empty. `list` dangles after removeKey, so nothing
+                // below may touch it.
                 if (list.items.len == 0) {
-                    const kv = self.map.fetchSwapRemove(key).?;
-                    self.gpa.free(kv.key);
-                    freeValue(self.gpa, kv.value.value);
+                    self.removeKey(key);
                 } else if (n > 0) {
                     entry.version = self.nextVersion();
-                }
-
-                // Delete-on-empty. Same invariant as single-element listPop.
-                if (list.items.len == 0) {
-                    const kv = self.map.fetchSwapRemove(key).?;
-                    self.gpa.free(kv.key);
-                    freeValue(self.gpa, kv.value.value);
                 }
 
                 return out;
@@ -343,10 +373,7 @@ pub const Store = struct {
         }
     }
 
-    pub fn listRange(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, start: i64, stop: i64, now_ms: i64) GetError![]const []const u8 {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
+    pub fn listRange(self: *Store, out_arena: std.mem.Allocator, key: []const u8, start: i64, stop: i64, now_ms: i64) GetError![]const []const u8 {
         const entry = self.getLiveEntry(key, now_ms) orelse return &.{};
         const list = switch (entry.value) {
             .list => |l| l,
@@ -376,10 +403,7 @@ pub const Store = struct {
         return out;
     }
 
-    pub fn listLength(self: *Store, io: Io, key: []const u8, now_ms: i64) GetError!usize {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
+    pub fn listLength(self: *Store, key: []const u8, now_ms: i64) GetError!usize {
         const entry = self.getLiveEntry(key, now_ms) orelse return 0;
         const list = switch (entry.value) {
             .list => |l| l,
@@ -389,7 +413,6 @@ pub const Store = struct {
         return list.items.len;
     }
 
-    // Caller must hold self.mutex
     fn enqueueWaiter(self: *Store, key: []const u8, waiter: *Waiter) !void {
         const key_copy = try self.gpa.dupe(u8, key);
         errdefer self.gpa.free(key_copy);
@@ -404,7 +427,8 @@ pub const Store = struct {
         gop.value_ptr.append(&waiter.node);
     }
 
-    // Caller must hold self.mutex. Idempotent: no-op if waiter isn't queued.
+    // Only for a waiter that is still queued. A delivered waiter was already
+    // unlinked by listPush, and removing it again would corrupt the list.
     fn dequeueWaiter(self: *Store, key: []const u8, waiter: *Waiter) void {
         const list_ptr = self.waiters.getPtr(key) orelse return;
         list_ptr.remove(&waiter.node);
@@ -418,103 +442,53 @@ pub const Store = struct {
         value: []const u8,
     };
 
-    fn blpopTimeoutSignaler(io: Io, duration_ms: u64, mutex: *Io.Mutex, cond: *Io.Condition) void {
-        // Sleep may return error.Canceled — bail out silently in that case,
-        // it means the waiter got its element and cancelled us.
-        Io.Clock.awake.sleep(io, .fromMilliseconds(duration_ms)) catch return;
-        // Signal under the mutex so the write is synchronized with the waiter's read.
-        mutex.lock(io) catch return;
-        defer mutex.unlock(io);
-        cond.signal(io);
-    }
-
     // Pop the head of `key`'s list. If the list is non-empty, act like a
     // non-blocking single-element listPop. If empty or absent, park as a
     // waiter and wait for either a push or the timeout. `timeout_ms == null`
-    // means block indefinitely. Returns null on timeout.
-    pub fn listPopBlocking(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, timeout_ms: ?u64, now_ms: i64) GetError!?BlockedPop {
-        try self.mutex.lock(io);
-        var mutex_held = true;
-        defer if (mutex_held) self.mutex.unlock(io);
-
-        // Fast path, element is already available.
-        if (self.getLiveEntry(key, now_ms)) |entry_ptr| {
-            switch (entry_ptr.value) {
-                .list => |*list| {
-                    if (list.items.len > 0) {
-                        const out_key = try out_arena.dupe(u8, key);
-                        const out_value = try out_arena.dupe(u8, list.items[0]);
-                        const removed = list.orderedRemove(0);
-                        self.gpa.free(removed);
-                        if (list.items.len == 0) {
-                            const kv = self.map.fetchSwapRemove(key).?;
-                            self.gpa.free(kv.key);
-                            freeValue(self.gpa, kv.value.value);
-                        } else {
-                            entry_ptr.version = self.nextVersion();
-                        }
-                        return .{ .key = out_key, .value = out_value };
-                    }
-                },
-                else => return error.WrongType,
-            }
+    // means block indefinitely; `0` means don't block at all (BLPOP inside
+    // MULTI). Returns null on timeout.
+    pub fn listPopBlocking(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, timeout_ms: ?u64, now_ms: i64) (GetError || Io.Cancelable)!?BlockedPop {
+        // Fast path, element is already available. A live list is never
+        // empty, so a non-null result always holds exactly one element.
+        if (try self.listPop(out_arena, key, 1, .head, now_ms)) |items| {
+            return .{ .key = try out_arena.dupe(u8, key), .value = items[0] };
         }
+        if (timeout_ms == 0) return null;
 
-        // Slow path, park and wait.
+        // Slow path, park and wait. The defer runs on every exit, including
+        // cancellation: free a delivered element, or unlink if never delivered.
         var waiter: Waiter = .{};
         try self.enqueueWaiter(key, &waiter);
+        defer if (waiter.delivered) |d| self.gpa.free(d) else self.dequeueWaiter(key, &waiter);
 
-        // Wait for delivery. Infinite → condvar. Bounded → poll: release mutex,
-        // sleep briefly, reacquire, check `delivered`. The mutex-held flag guards
-        // the outer defer against errors from sleep or lock (which can only occur
-        // on task cancellation, at which point the outer teardown is unwinding).
+        // Infinite → condvar (wait releases the mutex while parked). Bounded →
+        // poll, since Io.Condition has no timed wait.
         if (timeout_ms) |ms| {
             const deadline_ms = Io.Clock.awake.now(io).toMilliseconds() + @as(i64, @intCast(ms));
             while (waiter.delivered == null) {
                 const cur = Io.Clock.awake.now(io).toMilliseconds();
                 if (cur >= deadline_ms) break;
-
-                self.mutex.unlock(io);
-                mutex_held = false;
-                try io.sleep(.fromMilliseconds(50), .awake);
-                try self.mutex.lock(io);
-                mutex_held = true;
+                try self.sleepUnlocked(io, @min(50, @as(u64, @intCast(deadline_ms - cur))));
             }
         } else {
-            waiter.condition.wait(io, &self.mutex) catch |err| {
-                self.dequeueWaiter(key, &waiter);
-                return err;
-            };
+            while (waiter.delivered == null) try waiter.condition.wait(io, &self.mutex);
         }
 
-        // Post-wait: signaler sets delivered before signaling / before we notice
-        // on our next poll. If it's set, take the element; else we timed out.
-        if (waiter.delivered) |delivered| {
-            defer self.gpa.free(delivered);
-            const out_key = try out_arena.dupe(u8, key);
-            const out_value = try out_arena.dupe(u8, delivered);
-            return .{ .key = out_key, .value = out_value };
-        }
-
-        self.dequeueWaiter(key, &waiter);
-        return null;
+        const delivered = waiter.delivered orelse return null; // timed out
+        return .{ .key = try out_arena.dupe(u8, key), .value = try out_arena.dupe(u8, delivered) };
     }
 
-    pub fn streamAdd(self: *Store, io: Io, key: []const u8, id_spec: StreamIdSpec, fields: []const []const u8, now_ms: i64) StreamAddError!StreamEntryId {
+    pub fn streamAdd(self: *Store, key: []const u8, id_spec: StreamIdSpec, fields: []const []const u8, now_ms: i64) StreamAddError!StreamEntryId {
         const fields_copy = try self.gpa.alloc([]const u8, fields.len);
         errdefer self.gpa.free(fields_copy);
 
-        // ``duped` is re-read when the errdefer fires, so it always reflects the
-        // real count of live coies at unwind time.
+        // `duped` is re-read when the errdefer fires, so it always reflects the
+        // real count of live copies at unwind time.
         var duped: usize = 0;
         errdefer for (fields_copy[0..duped]) |f| self.gpa.free(f);
         while (duped < fields.len) : (duped += 1) {
             fields_copy[duped] = try self.gpa.dupe(u8, fields[duped]);
         }
-
-        // Phase 2: mutate. The lock is only held for the map/stream ops.
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
 
         var entry_ptr: *Entry = undefined;
         if (self.getLiveEntry(key, now_ms)) |ep| {
@@ -533,8 +507,8 @@ pub const Store = struct {
         const stream_ptr = &entry_ptr.value.stream;
 
         // Resolve the id spec against the last entry (if any) and validate.
-        // Errors here return without touching the stream, the errordefers up top
-        // free the field copies. The empty stream we amy have just created stays
+        // Errors here return without touching the stream, the errdefers up top
+        // free the field copies. The empty stream we may have just created stays
         // in the map; matches the same wart listPush has.
         const last: ?StreamEntryId = if (stream_ptr.items.len == 0)
             null
@@ -577,11 +551,8 @@ pub const Store = struct {
     }
 
     // Inclusive [start, end] scan. Copies matched entries' fields into out_arena
-    // so the caller can walk them after releasing the store mutex.
-    pub fn streamRange(self: *Store, io: Io, out_arena: std.mem.Allocator, key: []const u8, start: StreamEntryId, end: StreamEntryId, now_ms: i64) GetError![]const StreamRangeEntry {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
+    // so the caller can use them after the store changes.
+    pub fn streamRange(self: *Store, out_arena: std.mem.Allocator, key: []const u8, start: StreamEntryId, end: StreamEntryId, now_ms: i64) GetError![]const StreamRangeEntry {
         const entry_ptr = self.getLiveEntry(key, now_ms) orelse return &.{};
         const stream = switch (entry_ptr.value) {
             .stream => |s| s,
@@ -612,10 +583,7 @@ pub const Store = struct {
         return out;
     }
 
-    pub fn streamLastId(self: *Store, io: Io, key: []const u8, now_ms: i64) GetError!?StreamEntryId {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-
+    pub fn streamLastId(self: *Store, key: []const u8, now_ms: i64) GetError!?StreamEntryId {
         const entry_ptr = self.getLiveEntry(key, now_ms) orelse return null;
         const stream = switch (entry_ptr.value) {
             .stream => |s| s,

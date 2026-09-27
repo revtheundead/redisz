@@ -2,403 +2,290 @@ const std = @import("std");
 const resp = @import("resp.zig");
 const Store = @import("store.zig").Store;
 const StreamEntryId = @import("store.zig").StreamEntryId;
+const StreamIdSpec = @import("store.zig").StreamIdSpec;
 const StreamRangeEntry = @import("store.zig").StreamRangeEntry;
 const ClientState = @import("main.zig").ClientState;
 const Io = std.Io;
+
+const not_integer_msg = "ERR value is not an integer or out of range";
+const invalid_stream_id_msg = "ERR Invalid stream ID specified as stream command argument";
+
+// Everything a command handler needs. Built per command by the connection
+// loop, which holds store.mutex for the whole dispatch.
+pub const Context = struct {
+    io: Io,
+    arena: std.mem.Allocator, // reset after every command
+    store: *Store,
+    w: *Io.Writer, // collects the reply; sent once the command finishes
+    client: *ClientState,
+};
+
+const Handler = *const fn (ctx: *Context, args: []const []const u8) anyerror!void;
+
+const Command = struct {
+    handler: Handler,
+    // Redis convention: arg count including the command name. Positive means
+    // exactly that many, negative means at least -arity.
+    arity: i32,
+    // Runs immediately inside MULTI instead of being queued.
+    txn_control: bool = false,
+};
+
+const commands = std.StaticStringMapWithEql(Command, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{
+    .{ "ping", Command{ .handler = handlePing, .arity = -1 } },
+    .{ "echo", Command{ .handler = handleEcho, .arity = 2 } },
+    .{ "set", Command{ .handler = handleSet, .arity = -3 } },
+    .{ "get", Command{ .handler = handleGet, .arity = 2 } },
+    .{ "incr", Command{ .handler = handleIncr, .arity = 2 } },
+    .{ "type", Command{ .handler = handleType, .arity = 2 } },
+    .{ "rpush", Command{ .handler = handleRpush, .arity = -3 } },
+    .{ "lpush", Command{ .handler = handleLpush, .arity = -3 } },
+    .{ "lpop", Command{ .handler = handleLpop, .arity = -2 } },
+    .{ "blpop", Command{ .handler = handleBlpop, .arity = 3 } }, // single key only for now
+    .{ "lrange", Command{ .handler = handleLrange, .arity = 4 } },
+    .{ "llen", Command{ .handler = handleLlen, .arity = 2 } },
+    .{ "xadd", Command{ .handler = handleXadd, .arity = -5 } },
+    .{ "xrange", Command{ .handler = handleXrange, .arity = 4 } }, // no COUNT yet
+    .{ "xread", Command{ .handler = handleXread, .arity = -4 } },
+    .{ "multi", Command{ .handler = handleMulti, .arity = 1, .txn_control = true } },
+    .{ "exec", Command{ .handler = handleExec, .arity = 1, .txn_control = true } },
+    .{ "discard", Command{ .handler = handleDiscard, .arity = 1, .txn_control = true } },
+    .{ "watch", Command{ .handler = handleWatch, .arity = -2, .txn_control = true } },
+    .{ "unwatch", Command{ .handler = handleUnwatch, .arity = 1 } },
+});
 
 fn nowMs(io: Io) i64 {
     return Io.Clock.real.now(io).toMilliseconds();
 }
 
-fn isTxnControl(cmd: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(cmd, "MULTI") or std.ascii.eqlIgnoreCase(cmd, "EXEC") or std.ascii.eqlIgnoreCase(cmd, "DISCARD");
-}
-
-fn enqueueCommand(gpa: std.mem.Allocator, client: *ClientState, args: []const resp.Value) !void {
-    // Two-phase to keep the queue consistent on OOM: allocate + dupe first,
-    // append only when every dupe has succeeded
-    const dup_args = try gpa.alloc([]const u8, args.len);
-    errdefer gpa.free(dup_args);
-
-    var duped: usize = 0;
-    errdefer for (dup_args[0..duped]) |a| gpa.free(a);
-
-    while (duped < args.len) : (duped += 1) {
-        const raw = switch (args[duped]) {
-            .bulk_string => |m| m orelse return error.InvalidCommand,
-            else => return error.InvalidCommand,
-        };
-        dup_args[duped] = try gpa.dupe(u8, raw);
-    }
-
-    try client.queued.append(gpa, .{ .args = dup_args });
-}
-
-// Top-level command router. Reads args[0] and dispatches to a handler.
-// An if/else chain is fine up to ~20 commands; when we outgrow it we'll swap
-// in a comptime StaticStringMap.
-pub fn dispatch(io: Io, arena: std.mem.Allocator, store: *Store, w: *Io.Writer, value: resp.Value, client: *ClientState) !void {
-    const args = switch (value) {
-        .array => |maybe| maybe orelse return,
-        else => return,
-    };
+// Top-level command router. Validates the command against the table, queues
+// it when inside MULTI, and otherwise runs its handler.
+pub fn dispatch(ctx: *Context, value: resp.Value) !void {
+    const args = try toArgs(ctx.arena, value) orelse
+        return resp.writeError(ctx.w, "ERR Protocol error: expected an array of bulk strings");
     if (args.len == 0) return;
 
-    const cmd = switch (args[0]) {
-        .bulk_string => |maybe| maybe orelse return,
-        else => return,
-    };
-
-    if (client.in_multi and !isTxnControl(cmd)) {
-        if (std.ascii.eqlIgnoreCase(cmd, "WATCH"))
-            return try resp.writeError(w, "ERR WATCH inside MULTI is not allowed");
-        try enqueueCommand(store.gpa, client, args);
-        return try resp.writeSimpleString(w, "QUEUED");
+    const cmd = commands.get(args[0]) orelse
+        return rejectCommand(ctx, "ERR unknown command '{s}'", .{args[0]});
+    if (!arityOk(cmd.arity, args.len)) {
+        const name = try std.ascii.allocLowerString(ctx.arena, args[0]);
+        return rejectCommand(ctx, "ERR wrong number of arguments for '{s}' command", .{name});
     }
 
-    if (std.ascii.eqlIgnoreCase(cmd, "PING")) {
-        try handlePing(w);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "ECHO")) {
-        try handleEcho(w, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "SET")) {
-        try handleSet(io, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "GET")) {
-        try handleGet(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "RPUSH")) {
-        try handleRpush(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "LPUSH")) {
-        try handleLpush(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "LPOP")) {
-        try handleLpop(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "BLPOP")) {
-        try handleBlpop(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "LRANGE")) {
-        try handleLrange(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "LLEN")) {
-        try handleLlen(io, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "TYPE")) {
-        try handleType(io, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "XADD")) {
-        try handleXadd(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "XRANGE")) {
-        try handleXrange(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "XREAD")) {
-        try handleXread(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "INCR")) {
-        try handleIncr(io, arena, w, store, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "MULTI")) {
-        try handleMulti(w, client, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "EXEC")) {
-        try handleExec(io, arena, w, store, client, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "DISCARD")) {
-        try handleDiscard(w, store, client, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "WATCH")) {
-        try handleWatch(io, w, store, client, args);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "UNWATCH")) {
-        try handleUnwatch(w, store, client, args);
-    } else {
-        try w.print("-ERR unknown command '{s}'\r\n", .{cmd});
+    if (ctx.client.in_multi and !cmd.txn_control) {
+        try enqueueCommand(ctx.store.gpa, ctx.client, args);
+        return resp.writeSimpleString(ctx.w, "QUEUED");
     }
+    try cmd.handler(ctx, args);
 }
 
-fn handlePing(w: *Io.Writer) !void {
-    try resp.writeSimpleString(w, "PONG");
+// Clients send commands as an array of bulk strings. Returns null for any
+// other shape. The slices point into the parser's arena copies.
+fn toArgs(arena: std.mem.Allocator, value: resp.Value) !?[]const []const u8 {
+    const items = switch (value) {
+        .array => |maybe| maybe orelse return null,
+        else => return null,
+    };
+    const args = try arena.alloc([]const u8, items.len);
+    for (items, args) |item, *slot| {
+        slot.* = switch (item) {
+            .bulk_string => |maybe| maybe orelse return null,
+            else => return null,
+        };
+    }
+    return args;
 }
 
-fn handleEcho(w: *Io.Writer, args: []const resp.Value) !void {
-    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'echo'");
-    const arg = switch (args[1]) {
-        .bulk_string => |m| m orelse "",
-        else => return,
-    };
-    try resp.writeBulkString(w, arg);
+fn arityOk(arity: i32, argc: usize) bool {
+    if (arity >= 0) return argc == @as(usize, @intCast(arity));
+    return argc >= @as(usize, @intCast(-arity));
 }
 
-fn handleSet(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 3) return try resp.writeError(w, "ERR wrong number of arguments for 'set'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    const val = switch (args[2]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
+// Replies with an error for a command that never ran. Inside MULTI this also
+// dooms the transaction: EXEC will refuse to run any of it.
+fn rejectCommand(ctx: *Context, comptime fmt: []const u8, fmt_args: anytype) !void {
+    if (ctx.client.in_multi) ctx.client.multi_failed = true;
+    try resp.writeError(ctx.w, try std.fmt.allocPrint(ctx.arena, fmt, fmt_args));
+}
 
+// Replies for the store's user-facing errors. Anything else (OOM,
+// cancellation) propagates and closes the connection.
+fn writeStoreError(w: *Io.Writer, err: anyerror) anyerror!void {
+    const msg = switch (err) {
+        error.WrongType => "WRONGTYPE Operation against a key holding the wrong kind of value",
+        error.NotInteger => not_integer_msg,
+        error.Overflow => "ERR increment or decrement would overflow",
+        error.IdZero => "ERR The ID specified in XADD must be greater than 0-0",
+        error.IdEqualOrSmaller => "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+        else => return err,
+    };
+    try resp.writeError(w, msg);
+}
+
+fn enqueueCommand(gpa: std.mem.Allocator, client: *ClientState, args: []const []const u8) !void {
+    // The args live in the per-command arena, so the queue needs its own
+    // copies. Two-phase to keep the queue consistent on OOM: dupe everything
+    // first, append only when every dupe has succeeded.
+    const copy = try gpa.alloc([]const u8, args.len);
+    errdefer gpa.free(copy);
+
+    var duped: usize = 0;
+    errdefer for (copy[0..duped]) |a| gpa.free(a);
+    while (duped < args.len) : (duped += 1) {
+        copy[duped] = try gpa.dupe(u8, args[duped]);
+    }
+
+    try client.queued.append(gpa, copy);
+}
+
+fn handlePing(ctx: *Context, args: []const []const u8) anyerror!void {
+    _ = args;
+    try resp.writeSimpleString(ctx.w, "PONG");
+}
+
+fn handleEcho(ctx: *Context, args: []const []const u8) anyerror!void {
+    try resp.writeBulkString(ctx.w, args[1]);
+}
+
+fn handleSet(ctx: *Context, args: []const []const u8) anyerror!void {
     var expires_at_ms: ?i64 = null;
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
-        const opt = switch (args[i]) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
-
+        const opt = args[i];
         if (std.ascii.eqlIgnoreCase(opt, "PX") or std.ascii.eqlIgnoreCase(opt, "EX")) {
             i += 1;
-            if (i >= args.len) return try resp.writeError(w, "ERR syntax error");
-            const ttl_str = switch (args[i]) {
-                .bulk_string => |m| m orelse return,
-                else => return,
-            };
-            const ttl = std.fmt.parseInt(i64, ttl_str, 10) catch {
-                return try resp.writeError(w, "ERR value is not an integer or out of range");
-            };
+            if (i >= args.len) return resp.writeError(ctx.w, "ERR syntax error");
+            const ttl = std.fmt.parseInt(i64, args[i], 10) catch return resp.writeError(ctx.w, not_integer_msg);
             const ttl_ms = if (std.ascii.eqlIgnoreCase(opt, "PX")) ttl else ttl * 1000;
-            expires_at_ms = nowMs(io) + ttl_ms;
+            expires_at_ms = nowMs(ctx.io) + ttl_ms;
         } else {
-            return try resp.writeError(w, "ERR syntax error");
+            return resp.writeError(ctx.w, "ERR syntax error");
         }
     }
 
-    try store.set(io, key, val, expires_at_ms);
-    try resp.writeSimpleString(w, "OK");
+    try ctx.store.set(args[1], args[2], expires_at_ms);
+    try resp.writeSimpleString(ctx.w, "OK");
 }
 
-fn handleGet(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'get'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    const maybe_val = store.get(io, arena, key, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
+fn handleGet(ctx: *Context, args: []const []const u8) anyerror!void {
+    const maybe_val = ctx.store.get(ctx.arena, args[1], nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
     if (maybe_val) |val| {
-        try resp.writeBulkString(w, val);
+        try resp.writeBulkString(ctx.w, val);
     } else {
-        try resp.writeNullBulk(w);
+        try resp.writeNullBulk(ctx.w);
     }
 }
 
-fn handleRpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 3) return try resp.writeError(w, "ERR wrong number of arguments for 'rpush'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-
-    // Unpack the values from args[2..] into a plain slice. Arena-allocated,
-    // the store dupes each value with gpa, so nothing here needs to outlive
-    // dispatch.
-    const values = try arena.alloc([]const u8, args.len - 2);
-    for (args[2..], values) |arg, *slot| {
-        slot.* = switch (arg) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
-    }
-
-    const new_len = store.listPush(io, key, values, .tail, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
-
-    try resp.writeInteger(w, @intCast(new_len));
+fn handleIncr(ctx: *Context, args: []const []const u8) anyerror!void {
+    const res = ctx.store.incrBy(args[1], 1, nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
+    try resp.writeInteger(ctx.w, res);
 }
 
-fn handleLpush(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 3) return try resp.writeError(w, "ERR wrong number of arguments for 'lpush'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-
-    // Unpack the values from args[2..] into a plain slice. Arena-allocated,
-    // the store dupes each value with gpa, so nothing here needs to outlive
-    // dispatch.
-    const values = try arena.alloc([]const u8, args.len - 2);
-    for (args[2..], values) |arg, *slot| {
-        slot.* = switch (arg) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
-    }
-
-    const new_len = store.listPush(io, key, values, .head, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
-
-    try resp.writeInteger(w, @intCast(new_len));
+fn handleType(ctx: *Context, args: []const []const u8) anyerror!void {
+    const name = ctx.store.getType(args[1], nowMs(ctx.io)) orelse "none";
+    try resp.writeSimpleString(ctx.w, name);
 }
 
-fn handleLpop(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 2 or args.len > 3) return try resp.writeError(w, "ERR wrong number of arguments for 'lpop'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
+fn handleRpush(ctx: *Context, args: []const []const u8) anyerror!void {
+    try push(ctx, args, .tail);
+}
+
+fn handleLpush(ctx: *Context, args: []const []const u8) anyerror!void {
+    try push(ctx, args, .head);
+}
+
+fn push(ctx: *Context, args: []const []const u8, side: Store.Side) !void {
+    const new_len = ctx.store.listPush(ctx.io, args[1], args[2..], side, nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
+    try resp.writeInteger(ctx.w, @intCast(new_len));
+}
+
+fn handleLpop(ctx: *Context, args: []const []const u8) anyerror!void {
+    if (args.len > 3) return resp.writeError(ctx.w, "ERR wrong number of arguments for 'lpop' command");
 
     // Count is optional. Its PRESENCE, not its value, decides the reply
     // shape. LPOP key → bulk-or-null. LPOP key 0 → empty array, not null.
     const count: ?usize = if (args.len == 3) blk: {
-        const count_str = switch (args[2]) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
-        const parsed = std.fmt.parseInt(i64, count_str, 10) catch {
-            return try resp.writeError(w, "ERR value is not an integer or out of range");
-        };
-        if (parsed < 0) return try resp.writeError(w, "ERR value is out of range, must be positive");
+        const parsed = std.fmt.parseInt(i64, args[2], 10) catch return resp.writeError(ctx.w, not_integer_msg);
+        if (parsed < 0) return resp.writeError(ctx.w, "ERR value is out of range, must be positive");
         break :blk @intCast(parsed);
     } else null;
 
-    const maybe_items = store.listPop(io, arena, key, count orelse 1, .head, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
+    const maybe_items = ctx.store.listPop(ctx.arena, args[1], count orelse 1, .head, nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
 
     if (count == null) {
         // Single-element mode: bulk-or-null.
-        const items = maybe_items orelse return try resp.writeNullBulk(w);
-        if (items.len == 0) return try resp.writeNullBulk(w);
-        try resp.writeBulkString(w, items[0]);
+        const items = maybe_items orelse return resp.writeNullBulk(ctx.w);
+        if (items.len == 0) return resp.writeNullBulk(ctx.w);
+        try resp.writeBulkString(ctx.w, items[0]);
     } else {
         // Count mode: null-array on absent key, else an array of items.
-        const items = maybe_items orelse return try resp.writeNullArray(w);
-        try resp.writeArrayHeader(w, items.len);
-        for (items) |item| try resp.writeBulkString(w, item);
+        const items = maybe_items orelse return resp.writeNullArray(ctx.w);
+        try resp.writeArrayHeader(ctx.w, items.len);
+        for (items) |item| try resp.writeBulkString(ctx.w, item);
     }
 }
 
-fn handleBlpop(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
+fn handleBlpop(ctx: *Context, args: []const []const u8) anyerror!void {
     // Real BLPOP accepts multiple keys before the timeout: BLPOP k1 k2 ... timeout.
     // Single-key only for now, implement multi-key later.
-    if (args.len != 3) return try resp.writeError(w, "ERR wrong number of arguments for 'blpop'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    const timeout_str = switch (args[2]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-
-    const timeout_secs = std.fmt.parseFloat(f64, timeout_str) catch {
-        return try resp.writeError(w, "ERR timeout is not a valid float");
+    const timeout_secs = std.fmt.parseFloat(f64, args[2]) catch {
+        return resp.writeError(ctx.w, "ERR timeout is not a float or out of range");
     };
     if (!std.math.isFinite(timeout_secs) or timeout_secs < 0) {
-        return try resp.writeError(w, "ERR timeout is negative");
+        return resp.writeError(ctx.w, "ERR timeout is negative");
     }
-    const timeout_ms: ?u64 = if (timeout_secs == 0.0)
+
+    // Redis never blocks inside a transaction (it would stall every other
+    // client); an empty list gives the timeout reply straight away. A zero
+    // timeout from the client means "forever".
+    const timeout_ms: ?u64 = if (ctx.client.in_multi)
+        0
+    else if (timeout_secs == 0.0)
         null
     else
-        @intFromFloat(timeout_secs * 1000.0);
+        @intFromFloat(@ceil(timeout_secs * 1000.0));
 
-    const maybe_result = store.listPopBlocking(io, arena, key, timeout_ms, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
+    const maybe_result = ctx.store.listPopBlocking(ctx.io, ctx.arena, args[1], timeout_ms, nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
 
     if (maybe_result) |result| {
-        try resp.writeArrayHeader(w, 2);
-        try resp.writeBulkString(w, result.key);
-        try resp.writeBulkString(w, result.value);
+        try resp.writeArrayHeader(ctx.w, 2);
+        try resp.writeBulkString(ctx.w, result.key);
+        try resp.writeBulkString(ctx.w, result.value);
     } else {
-        try resp.writeNullArray(w);
+        try resp.writeNullArray(ctx.w);
     }
 }
 
-fn handleLrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 4) return try resp.writeError(w, "ERR wrong number of arguments for 'lrange'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    const start_str = switch (args[2]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    const stop_str = switch (args[3]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
+fn handleLrange(ctx: *Context, args: []const []const u8) anyerror!void {
+    const start = std.fmt.parseInt(i64, args[2], 10) catch return resp.writeError(ctx.w, not_integer_msg);
+    const stop = std.fmt.parseInt(i64, args[3], 10) catch return resp.writeError(ctx.w, not_integer_msg);
 
-    const start = std.fmt.parseInt(i64, start_str, 10) catch {
-        return try resp.writeError(w, "ERR value is not an integer or out of range");
-    };
-    const stop = std.fmt.parseInt(i64, stop_str, 10) catch {
-        return try resp.writeError(w, "ERR value is not an integer or out of range");
-    };
+    const items = ctx.store.listRange(ctx.arena, args[1], start, stop, nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
 
-    const items = store.listRange(io, arena, key, start, stop, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
-
-    try resp.writeArrayHeader(w, items.len);
-    for (items) |item| try resp.writeBulkString(w, item);
+    try resp.writeArrayHeader(ctx.w, items.len);
+    for (items) |item| try resp.writeBulkString(ctx.w, item);
 }
 
-fn handleLlen(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'llen'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-
-    const len = store.listLength(io, key, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
-
-    try resp.writeInteger(w, @intCast(len));
+fn handleLlen(ctx: *Context, args: []const []const u8) anyerror!void {
+    const len = ctx.store.listLength(args[1], nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
+    try resp.writeInteger(ctx.w, @intCast(len));
 }
 
-fn handleType(io: Io, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len != 2) return try resp.writeError(w, "ERR wrong number of arguments for 'type'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
+fn handleXadd(ctx: *Context, args: []const []const u8) anyerror!void {
+    // XADD key id field1 value1 [field2 value2 ...]; pairs must be even.
+    if ((args.len - 3) % 2 != 0) return resp.writeError(ctx.w, "ERR wrong number of arguments for 'xadd' command");
 
-    const maybe_tag = try store.getType(io, key, nowMs(io));
-    const name = maybe_tag orelse "none";
-    try resp.writeSimpleString(w, name);
-}
+    const id_spec = parseStreamIdSpec(args[2]) catch return resp.writeError(ctx.w, invalid_stream_id_msg);
 
-fn handleXadd(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    // XADD key id field1 value1 [field2 value2 ...]
-    // Need key + id + at least one field/value pair, and pairs must be even.
-    if (args.len < 5 or (args.len - 3) % 2 != 0) {
-        return try resp.writeError(w, "ERR wrong number of arguments for 'xadd'");
-    }
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    const id_str = switch (args[2]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-
-    const id_spec = parseStreamIdSpec(id_str) catch {
-        return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
-    };
-
-    const fields = try arena.alloc([]const u8, args.len - 3);
-    for (args[3..], fields) |arg, *slot| {
-        slot.* = switch (arg) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
-    }
-
-    const assigned = store.streamAdd(io, key, id_spec, fields, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        error.IdZero => return try resp.writeError(w, "ERR The ID specified in XADD must be greater than 0-0"),
-        error.IdEqualOrSmaller => return try resp.writeError(w, "ERR The ID specified in XADD is equal or smaller than the target stream top item"),
-        else => |e| return e,
-    };
+    const assigned = ctx.store.streamAdd(args[1], id_spec, args[3..], nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
 
     // u64-u64: max 20 + 1 + 20 = 41 bytes
     var buf: [48]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d}-{d}", .{ assigned.ms, assigned.seq }) catch unreachable;
-    try resp.writeBulkString(w, s);
+    try resp.writeBulkString(ctx.w, s);
 }
 
-fn parseStreamIdSpec(s: []const u8) !@import("store.zig").StreamIdSpec {
+fn parseStreamIdSpec(s: []const u8) !StreamIdSpec {
     if (std.mem.eql(u8, s, "*")) return .fully_auto;
     const dash = std.mem.indexOfScalar(u8, s, '-') orelse return error.InvalidId;
     const ms = std.fmt.parseInt(u64, s[0..dash], 10) catch return error.InvalidId;
@@ -408,111 +295,67 @@ fn parseStreamIdSpec(s: []const u8) !@import("store.zig").StreamIdSpec {
     return .{ .explicit = .{ .ms = ms, .seq = seq } };
 }
 
-fn handleXrange(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len != 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xrange'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    const start_str = switch (args[2]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-    const end_str = switch (args[3]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
+fn handleXrange(ctx: *Context, args: []const []const u8) anyerror!void {
+    const start = parseStreamRangeBounds(args[2], 0) catch return resp.writeError(ctx.w, invalid_stream_id_msg);
+    const end = parseStreamRangeBounds(args[3], std.math.maxInt(u64)) catch return resp.writeError(ctx.w, invalid_stream_id_msg);
 
-    const start = parseStreamRangeBounds(start_str, 0) catch {
-        return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
-    };
-    const end = parseStreamRangeBounds(end_str, std.math.maxInt(u64)) catch {
-        return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
-    };
+    const entries = ctx.store.streamRange(ctx.arena, args[1], start, end, nowMs(ctx.io)) catch |err| return writeStoreError(ctx.w, err);
 
-    const entries = store.streamRange(io, arena, key, start, end, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
-
-    try resp.writeArrayHeader(w, entries.len);
-    var buf: [48]u8 = undefined;
-    for (entries) |entry| {
-        try resp.writeArrayHeader(w, 2);
-        const id_str = std.fmt.bufPrint(&buf, "{d}-{d}", .{ entry.id.ms, entry.id.seq }) catch unreachable;
-        try resp.writeBulkString(w, id_str);
-        try resp.writeArrayHeader(w, entry.fields.len);
-        for (entry.fields) |f| try resp.writeBulkString(w, f);
-    }
+    try resp.writeArrayHeader(ctx.w, entries.len);
+    for (entries) |entry| try writeStreamEntry(ctx.w, entry);
 }
 
-fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    // XREAD STREAMS key1 [key2 ...] id1 [id2 ...]
-    if (args.len < 4) return try resp.writeError(w, "ERR wrong number of arguments for 'xread'");
+fn writeStreamEntry(w: *Io.Writer, entry: StreamRangeEntry) !void {
+    var buf: [48]u8 = undefined;
+    try resp.writeArrayHeader(w, 2);
+    const id_str = std.fmt.bufPrint(&buf, "{d}-{d}", .{ entry.id.ms, entry.id.seq }) catch unreachable;
+    try resp.writeBulkString(w, id_str);
+    try resp.writeArrayHeader(w, entry.fields.len);
+    for (entry.fields) |f| try resp.writeBulkString(w, f);
+}
 
+fn handleXread(ctx: *Context, args: []const []const u8) anyerror!void {
+    // XREAD [BLOCK ms] STREAMS key1 [key2 ...] id1 [id2 ...]
     var block_ms: ?u64 = null;
     var i: usize = 1;
     while (i < args.len) {
-        const tok = switch (args[i]) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
+        const tok = args[i];
         if (std.ascii.eqlIgnoreCase(tok, "STREAMS")) break;
         if (std.ascii.eqlIgnoreCase(tok, "BLOCK")) {
             i += 1;
-            if (i >= args.len) return try resp.writeError(w, "ERR syntax error");
-            const ms_str = switch (args[i]) {
-                .bulk_string => |m| m orelse return,
-                else => return,
+            if (i >= args.len) return resp.writeError(ctx.w, "ERR syntax error");
+            const parsed = std.fmt.parseInt(i64, args[i], 10) catch {
+                return resp.writeError(ctx.w, "ERR timeout is not an integer or out of range");
             };
-            const parsed = std.fmt.parseInt(i64, ms_str, 10) catch {
-                return try resp.writeError(w, "ERR timeout is not an integer or out of range");
-            };
-            if (parsed < 0) return try resp.writeError(w, "ERR timeout is negative");
+            if (parsed < 0) return resp.writeError(ctx.w, "ERR timeout is negative");
             block_ms = @intCast(parsed);
             i += 1;
             continue;
         }
-        return try resp.writeError(w, "ERR syntax error");
+        return resp.writeError(ctx.w, "ERR syntax error");
     }
-    if (i >= args.len) return try resp.writeError(w, "ERR syntax error");
+    if (i >= args.len) return resp.writeError(ctx.w, "ERR syntax error");
     i += 1; // step past STREAMS
     const rest = args[i..];
     if (rest.len == 0 or rest.len % 2 != 0) {
-        return try resp.writeError(w, "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.");
+        return resp.writeError(ctx.w, "ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.");
     }
     const n = rest.len / 2;
+    const keys = rest[0..n];
+    const ids = rest[n..];
 
-    // Pull the arg strings out once so we don't re-unpack unions later.
-    const keys = try arena.alloc([]const u8, n);
-    const ids = try arena.alloc([]const u8, n);
-    for (rest[0..n], keys) |arg, *slot| {
-        slot.* = switch (arg) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
-    }
-    for (rest[n..], ids) |arg, *slot| {
-        slot.* = switch (arg) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
-    }
+    // Same rule as BLPOP: no blocking inside a transaction.
+    if (ctx.client.in_multi) block_ms = null;
 
     // Pre-compute successor IDs
-    const start_next = try arena.alloc(?StreamEntryId, n);
-    const now0 = nowMs(io);
+    const start_next = try ctx.arena.alloc(?StreamEntryId, n);
+    const now0 = nowMs(ctx.io);
     for (ids, keys, start_next) |id_str, key, *slot| {
-        const parsed = parseXreadStart(id_str) catch {
-            return try resp.writeError(w, "ERR Invalid stream ID specified as stream command argument");
-        };
+        const parsed = parseXreadStart(id_str) catch return resp.writeError(ctx.w, invalid_stream_id_msg);
 
         const base: StreamEntryId = switch (parsed) {
             .explicit => |id| id,
-            .latest => (store.streamLastId(io, key, now0) catch |err| switch (err) {
-                error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-                else => |e| return e,
-            }) orelse .{ .ms = 0, .seq = 0 },
+            .latest => (ctx.store.streamLastId(key, now0) catch |err| return writeStoreError(ctx.w, err)) orelse .{ .ms = 0, .seq = 0 },
         };
         slot.* = nextStreamId(base);
     }
@@ -520,61 +363,51 @@ fn handleXread(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, a
     // Query all streams up front. Empty results are kept in place so indices
     // line up with `keys`; we skip them during the write pass.
     const max_id: StreamEntryId = .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
-    const per_stream = try arena.alloc([]const StreamRangeEntry, n);
+    const per_stream = try ctx.arena.alloc([]const StreamRangeEntry, n);
 
     const deadline_awake_ms: ?i64 = if (block_ms) |ms|
-        (if (ms == 0) null else Io.Clock.awake.now(io).toMilliseconds() + @as(i64, @intCast(ms)))
+        (if (ms == 0) null else Io.Clock.awake.now(ctx.io).toMilliseconds() + @as(i64, @intCast(ms)))
     else
         null;
 
     var non_empty: usize = 0;
     while (true) {
         non_empty = 0;
-        const now = nowMs(io);
+        const now = nowMs(ctx.io);
         for (0..n) |k| {
             const sn = start_next[k] orelse {
                 per_stream[k] = &.{};
                 continue;
             };
-            per_stream[k] = store.streamRange(io, arena, keys[k], sn, max_id, now) catch |err| switch (err) {
-                error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-                else => |e| return e,
-            };
+            per_stream[k] = ctx.store.streamRange(ctx.arena, keys[k], sn, max_id, now) catch |err| return writeStoreError(ctx.w, err);
             if (per_stream[k].len > 0) non_empty += 1;
         }
         if (non_empty > 0) break;
         if (block_ms == null) break; // one-shot
 
-        const cur = Io.Clock.awake.now(io).toMilliseconds();
+        // Poll: release the store so writers can get in, then re-check.
+        const cur = Io.Clock.awake.now(ctx.io).toMilliseconds();
         if (deadline_awake_ms) |dl| {
             if (cur >= dl) break;
             const remaining: u64 = @intCast(dl - cur);
-            try io.sleep(.fromMilliseconds(@min(50, remaining)), .awake);
+            try ctx.store.sleepUnlocked(ctx.io, @min(50, remaining));
         } else {
-            try io.sleep(.fromMilliseconds(50), .awake);
+            try ctx.store.sleepUnlocked(ctx.io, 50);
         }
     }
 
     // Real Redis omits empty streams from the reply and returns a null array
-    // when nothing has entries. Matching that keeps the wire format right for
-    // the blocking-XREAD stage later, where "nothing yet" needs to be
-    // distinguishable from "here's the data".
-    if (non_empty == 0) return try resp.writeNullArray(w);
+    // when nothing has entries, so "nothing yet" is distinguishable from
+    // "here's the data" for blocking reads.
+    if (non_empty == 0) return resp.writeNullArray(ctx.w);
 
-    try resp.writeArrayHeader(w, non_empty);
-    var buf: [48]u8 = undefined;
+    try resp.writeArrayHeader(ctx.w, non_empty);
     for (0..n) |j| {
         if (per_stream[j].len == 0) continue;
-        try resp.writeArrayHeader(w, 2);
-        try resp.writeBulkString(w, keys[j]);
-        try resp.writeArrayHeader(w, per_stream[j].len);
-        for (per_stream[j]) |entry| {
-            try resp.writeArrayHeader(w, 2);
-            const id_str = std.fmt.bufPrint(&buf, "{d}-{d}", .{ entry.id.ms, entry.id.seq }) catch unreachable;
-            try resp.writeBulkString(w, id_str);
-            try resp.writeArrayHeader(w, entry.fields.len);
-            for (entry.fields) |f| try resp.writeBulkString(w, f);
-        }
+        try resp.writeArrayHeader(ctx.w, 2);
+        try resp.writeBulkString(ctx.w, keys[j]);
+        try resp.writeArrayHeader(ctx.w, per_stream[j].len);
+        for (per_stream[j]) |entry| try writeStreamEntry(ctx.w, entry);
     }
 }
 
@@ -619,113 +452,77 @@ fn parseXreadStart(s: []const u8) !XreadStart {
     return .{ .explicit = .{ .ms = ms, .seq = 0 } };
 }
 
-fn handleIncr(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, args: []const resp.Value) !void {
-    if (args.len != 2) return try resp.writeError(w, "ERR wrong number of arguments for 'incr'");
-    const key = switch (args[1]) {
-        .bulk_string => |m| m orelse return,
-        else => return,
-    };
-
-    const maybe_val = store.get(io, arena, key, nowMs(io)) catch |err| switch (err) {
-        error.WrongType => return try resp.writeError(w, "WRONGTYPE Operation against a key holding the wrong kind of value"),
-        else => |e| return e,
-    };
-
-    const cur: i64 = if (maybe_val) |s|
-        (std.fmt.parseInt(i64, s, 10) catch {
-            return try resp.writeError(w, "ERR value is not an integer or out of range");
-        })
-    else
-        0;
-
-    const res = std.math.add(i64, cur, 1) catch {
-        return try resp.writeError(w, "ERR increment or decrement would overflow");
-    };
-
-    // max i64 is 19 digits + sign = 20 digits
-    var buf: [20]u8 = undefined;
-    const res_str = std.fmt.bufPrint(&buf, "{d}", .{res}) catch unreachable;
-    try store.set(io, key, res_str, null);
-    try resp.writeInteger(w, res);
+fn handleMulti(ctx: *Context, args: []const []const u8) anyerror!void {
+    _ = args;
+    if (ctx.client.in_multi) return resp.writeError(ctx.w, "ERR MULTI calls can not be nested");
+    ctx.client.in_multi = true;
+    try resp.writeSimpleString(ctx.w, "OK");
 }
 
-fn handleMulti(w: *Io.Writer, client: *ClientState, args: []const resp.Value) !void {
-    if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'multi'");
-    if (client.in_multi) return try resp.writeError(w, "ERR MULTI calls can not be nested");
-    client.in_multi = true;
-    try resp.writeSimpleString(w, "OK");
-}
+fn handleExec(ctx: *Context, args: []const []const u8) anyerror!void {
+    _ = args;
+    const client = ctx.client;
+    const gpa = ctx.store.gpa;
+    if (!client.in_multi) return resp.writeError(ctx.w, "ERR EXEC without MULTI");
 
-fn handleExec(io: Io, arena: std.mem.Allocator, w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) anyerror!void {
-    if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'exec'");
-    if (!client.in_multi) return try resp.writeError(w, "ERR EXEC without MULTI");
+    // The queued commands run with in_multi still set, so blocking commands
+    // see it and don't block. The defers run even if a command fails midway,
+    // leaving the client clean. Watches are always flushed after EXEC.
+    defer client.resetMulti(gpa);
+    defer client.clearWatch(gpa);
 
-    // Order matters: clear in_multi BEFORE re-dispatching, so the intercept
-    // above doesn't re-fire on the queued commands. defer the queue cleanup
-    // so a mid-loop error still leaves ClientState in a clean state (the
-    // connection's deinit would double-free otherwise).
-    client.in_multi = false;
-    defer client.clearQueue(store.gpa);
-    defer client.clearWatch(store.gpa); // watches always flushed after EXEC
-
-    // Optimistic-lock gate: if any watched key changed since WATCH, the whole
-    // transaction is discarded and EXEC replies with a null array.
-    if (try watchDirty(io, store, client)) {
-        return try resp.writeNullArray(w);
+    if (client.multi_failed) {
+        return resp.writeError(ctx.w, "EXECABORT Transaction discarded because of previous errors.");
     }
 
-    try resp.writeArrayHeader(w, client.queued.items.len);
-    for (client.queued.items) |cmd| {
-        // Wrap the raw gpa-owned args back into resp.Value shape so we can
-        // re-enter dispatch. The wrapper array lives in the arena; the
-        // inner slices still point into the queue's gpa storage (safe: the
-        // defer above fires only after the loop finishes).
-        const wrapped = try arena.alloc(resp.Value, cmd.args.len);
-        for (cmd.args, wrapped) |raw, *slot| slot.* = .{ .bulk_string = raw };
-        try dispatch(io, arena, store, w, .{ .array = wrapped }, client);
+    // Optimistic-lock gate: if any watched key changed since WATCH, the whole
+    // transaction is discarded and EXEC replies with a null array. We hold
+    // the store mutex from this check through the last queued command, so
+    // nothing can slip in between.
+    if (watchDirty(ctx)) return resp.writeNullArray(ctx.w);
+
+    try resp.writeArrayHeader(ctx.w, client.queued.items.len);
+    for (client.queued.items) |queued_args| {
+        const cmd = commands.get(queued_args[0]).?; // validated when queued
+        try cmd.handler(ctx, queued_args);
     }
 }
 
 // True if any watched key's current version differs from what WATCH recorded.
-fn watchDirty(io: Io, store: *Store, client: *ClientState) !bool {
-    const now = nowMs(io);
-    for (client.watched.items) |wk| {
-        const current = try store.watchVersion(io, wk.key, now);
-        if (current != wk.version) return true;
+fn watchDirty(ctx: *Context) bool {
+    const now = nowMs(ctx.io);
+    for (ctx.client.watched.items) |wk| {
+        if (ctx.store.watchVersion(wk.key, now) != wk.version) return true;
     }
     return false;
 }
 
-fn handleDiscard(w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) !void {
-    if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'discard'");
-    if (!client.in_multi) return try resp.writeError(w, "ERR DISCARD without MULTI");
-    client.clearQueue(store.gpa);
-    client.clearWatch(store.gpa);
-    client.in_multi = false;
-    try resp.writeSimpleString(w, "OK");
+fn handleDiscard(ctx: *Context, args: []const []const u8) anyerror!void {
+    _ = args;
+    if (!ctx.client.in_multi) return resp.writeError(ctx.w, "ERR DISCARD without MULTI");
+    ctx.client.resetMulti(ctx.store.gpa);
+    ctx.client.clearWatch(ctx.store.gpa);
+    try resp.writeSimpleString(ctx.w, "OK");
 }
 
-fn handleWatch(io: Io, w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) !void {
-    if (args.len < 2) return try resp.writeError(w, "ERR wrong number of arguments for 'watch'");
+fn handleWatch(ctx: *Context, args: []const []const u8) anyerror!void {
+    if (ctx.client.in_multi) return resp.writeError(ctx.w, "ERR WATCH inside MULTI is not allowed");
 
-    const now = nowMs(io);
-    for (args[1..]) |arg| {
-        const key = switch (arg) {
-            .bulk_string => |m| m orelse return,
-            else => return,
-        };
-        const version = try store.watchVersion(io, key, now);
+    const gpa = ctx.store.gpa;
+    const now = nowMs(ctx.io);
+    for (args[1..]) |key| {
+        const version = ctx.store.watchVersion(key, now);
 
         // Key must outlive this dispatch (freed at EXEC/DISCARD/UNWATCH)
-        const key_copy = try store.gpa.dupe(u8, key);
-        errdefer store.gpa.free(key_copy);
-        try client.watched.append(store.gpa, .{ .key = key_copy, .version = version });
+        const key_copy = try gpa.dupe(u8, key);
+        errdefer gpa.free(key_copy);
+        try ctx.client.watched.append(gpa, .{ .key = key_copy, .version = version });
     }
-    try resp.writeSimpleString(w, "OK");
+    try resp.writeSimpleString(ctx.w, "OK");
 }
 
-fn handleUnwatch(w: *Io.Writer, store: *Store, client: *ClientState, args: []const resp.Value) !void {
-    if (args.len != 1) return try resp.writeError(w, "ERR wrong number of arguments for 'unwatch'");
-    client.clearWatch(store.gpa);
-    try resp.writeSimpleString(w, "OK");
+fn handleUnwatch(ctx: *Context, args: []const []const u8) anyerror!void {
+    _ = args;
+    ctx.client.clearWatch(ctx.store.gpa);
+    try resp.writeSimpleString(ctx.w, "OK");
 }
