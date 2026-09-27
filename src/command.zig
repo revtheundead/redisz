@@ -5,6 +5,7 @@ const StreamEntryId = @import("store.zig").StreamEntryId;
 const StreamIdSpec = @import("store.zig").StreamIdSpec;
 const StreamRangeEntry = @import("store.zig").StreamRangeEntry;
 const ClientState = @import("main.zig").ClientState;
+const Config = @import("config.zig").Config;
 const Io = std.Io;
 
 const not_integer_msg = "ERR value is not an integer or out of range";
@@ -16,6 +17,7 @@ pub const Context = struct {
     io: Io,
     arena: std.mem.Allocator, // reset after every command
     store: *Store,
+    config: *const Config,
     w: *Io.Writer, // collects the reply; sent once the command finishes
     client: *ClientState,
 };
@@ -34,6 +36,7 @@ const Command = struct {
 const commands = std.StaticStringMapWithEql(Command, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{
     .{ "ping", Command{ .handler = handlePing, .arity = -1 } },
     .{ "echo", Command{ .handler = handleEcho, .arity = 2 } },
+    .{ "info", Command{ .handler = handleInfo, .arity = -1 } },
     .{ "set", Command{ .handler = handleSet, .arity = -3 } },
     .{ "get", Command{ .handler = handleGet, .arity = 2 } },
     .{ "incr", Command{ .handler = handleIncr, .arity = 2 } },
@@ -145,6 +148,29 @@ fn handlePing(ctx: *Context, args: []const []const u8) anyerror!void {
 
 fn handleEcho(ctx: *Context, args: []const []const u8) anyerror!void {
     try resp.writeBulkString(ctx.w, args[1]);
+}
+
+// INFO [section ...]. Replies with one bulk string of `key:value` lines,
+// grouped under `# Section` headers.
+fn handleInfo(ctx: *Context, args: []const []const u8) anyerror!void {
+    var out: Io.Writer.Allocating = .init(ctx.arena);
+    const info = &out.writer;
+
+    if (wantsSection(args, "replication")) {
+        try info.writeAll("# Replication\r\n");
+        try info.writeAll("role:master\r\n"); // becomes "slave" with --replicaof
+    }
+
+    try resp.writeBulkString(ctx.w, out.written());
+}
+
+// Plain INFO (no arguments) shows every section we have
+fn wantsSection(args: []const []const u8, name: []const u8) bool {
+    if (args.len == 1) return true;
+    for (args[1..]) |section| {
+        if (std.ascii.eqlIgnoreCase(section, name)) return true;
+    }
+    return false;
 }
 
 fn handleSet(ctx: *Context, args: []const []const u8) anyerror!void {

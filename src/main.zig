@@ -2,6 +2,7 @@ const std = @import("std");
 const resp = @import("resp.zig");
 const Store = @import("store.zig").Store;
 const command = @import("command.zig");
+const Config = @import("config.zig").Config;
 const Io = std.Io;
 
 pub const WatchedKey = struct {
@@ -47,10 +48,13 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
 
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const config = try Config.parse(args);
+
     var store: Store = .init(gpa);
     defer store.deinit();
 
-    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 6379);
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", config.port);
     var server = try address.listen(io, .{
         .reuse_address = true,
     });
@@ -64,11 +68,11 @@ pub fn main(init: std.process.Init) !void {
             error.Canceled => break,
             else => return err,
         };
-        try clients.concurrent(io, handleClient, .{ io, connection, &store });
+        try clients.concurrent(io, handleClient, .{ io, connection, &store, &config });
     }
 }
 
-fn handleClient(io: Io, stream: Io.net.Stream, store: *Store) Io.Cancelable!void {
+fn handleClient(io: Io, stream: Io.net.Stream, store: *Store, config: *const Config) Io.Cancelable!void {
     defer stream.close(io);
 
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -102,6 +106,7 @@ fn handleClient(io: Io, stream: Io.net.Stream, store: *Store) Io.Cancelable!void
             .io = io,
             .arena = arena,
             .store = store,
+            .config = config,
             .w = &reply.writer,
             .client = &client,
         };
